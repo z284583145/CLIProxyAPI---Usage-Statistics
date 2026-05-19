@@ -21,6 +21,8 @@ AUTH_DIR = os.path.expanduser("~/.cli-proxy-api")
 DB_PATH = os.path.join(BASE_DIR, "usage.sqlite")
 CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
 LOCAL_TZ = ZoneInfo("Asia/Shanghai")
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_CLIPROXY_CONFIG_PATH = os.path.abspath(os.path.join(SCRIPT_DIR, os.pardir, "config.yaml"))
 
 
 DEFAULT_CONFIG = {
@@ -28,9 +30,10 @@ DEFAULT_CONFIG = {
     "cliproxy_port": 8317,
     "management_key": "",
     "poll_interval_seconds": 2,
-    "quota_refresh_seconds": 300,
+    "quota_refresh_seconds": 7200,
     "dashboard_host": "127.0.0.1",
     "dashboard_port": 8320,
+    "cliproxy_config_path": DEFAULT_CLIPROXY_CONFIG_PATH,
 }
 
 
@@ -49,6 +52,7 @@ def load_config():
     merged = dict(DEFAULT_CONFIG)
     merged.update(cfg)
     merged["management_key"] = os.environ.get("CLIPROXY_MANAGEMENT_KEY", merged["management_key"])
+    merged["cliproxy_config_path"] = os.environ.get("CLIPROXY_CONFIG_PATH", merged["cliproxy_config_path"])
     return merged
 
 
@@ -381,8 +385,99 @@ def range_bounds(name):
     return start.astimezone(dt.timezone.utc).timestamp(), now.astimezone(dt.timezone.utc).timestamp()
 
 
+def strip_yaml_scalar(value):
+    text = value.strip()
+    if (text.startswith('"') and text.endswith('"')) or (text.startswith("'") and text.endswith("'")):
+        return text[1:-1]
+    return text.split(" #", 1)[0].strip()
+
+
+def configured_api_keys(config_path):
+    if not config_path:
+        return []
+    path = os.path.expanduser(config_path)
+    if not os.path.exists(path):
+        return []
+    keys = []
+    in_top_level_api_keys = False
+    with open(path, encoding="utf-8-sig") as f:
+        for raw in f:
+            if not raw.strip():
+                continue
+            stripped = raw.strip()
+            if stripped.startswith("#"):
+                if in_top_level_api_keys and not raw.startswith(" "):
+                    break
+                continue
+            indent = len(raw) - len(raw.lstrip(" "))
+            if indent == 0 and stripped == "api-keys:":
+                in_top_level_api_keys = True
+                continue
+            if in_top_level_api_keys:
+                if indent == 0:
+                    break
+                if stripped.startswith("- "):
+                    key = strip_yaml_scalar(stripped[2:])
+                    if key:
+                        keys.append(key)
+    return keys
+
+
+def api_key_hash(value):
+    return hashlib.sha256(value.encode()).hexdigest()[:12]
+
+
+def mask_config_api_key(value):
+    text = str(value or "")
+    if not text:
+        return "unknown"
+    if "-" in text[3:]:
+        return text.rsplit("-", 1)[-1][-4:]
+    if text.startswith("sk-") and len(text) > 10:
+        return text[-4:]
+    if len(text) <= 8:
+        return text
+    return text[-4:]
+
+
+def configured_api_summaries(stats_by_hash, config_path):
+    configured = configured_api_keys(config_path)
+    if not configured:
+        return [
+            {
+                "label": "unknown" if key_hash == "unknown" else "hash******" + key_hash[-4:],
+                **values,
+            }
+            for key_hash, values in sorted(
+                stats_by_hash.items(), key=lambda item: item[1]["total_tokens"], reverse=True
+            )
+        ]
+    summaries = []
+    for key in configured:
+        key_hash = api_key_hash(key)
+        values = stats_by_hash.get(
+            key_hash,
+            {
+                "requests": 0,
+                "succeeded": 0,
+                "failed": 0,
+                "total_tokens": 0,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "reasoning_tokens": 0,
+            },
+        )
+        summaries.append({"label": mask_config_api_key(key), "api_key_hash": key_hash, **values})
+    return sorted(summaries, key=lambda item: item["total_tokens"], reverse=True)
+
+
+def configured_api_label_by_hash(config_path):
+    return {api_key_hash(key): mask_config_api_key(key) for key in configured_api_keys(config_path)}
+
+
 def query_summary(range_name):
     start, end = range_bounds(range_name)
+    cfg = load_config()
     with db_connect() as conn:
         total = conn.execute(
             """
@@ -433,12 +528,29 @@ def query_summary(range_name):
             """,
             (start, end),
         ).fetchall()
+        apis = conn.execute(
+            """
+            SELECT COALESCE(NULLIF(api_key_hash, ''), 'unknown') api_key_hash,
+                   COUNT(*) requests,
+                   COALESCE(SUM(CASE WHEN failed = 0 THEN 1 ELSE 0 END),0) succeeded,
+                   COALESCE(SUM(failed),0) failed,
+                   COALESCE(SUM(total_tokens),0) total_tokens,
+                   COALESCE(SUM(input_tokens),0) input_tokens,
+                   COALESCE(SUM(output_tokens),0) output_tokens,
+                   COALESCE(SUM(reasoning_tokens),0) reasoning_tokens
+            FROM usage_events WHERE ts_epoch BETWEEN ? AND ?
+            GROUP BY api_key_hash ORDER BY total_tokens DESC LIMIT 12
+            """,
+            (start, end),
+        ).fetchall()
+        api_stats = {row["api_key_hash"]: {k: row[k] for k in row.keys() if k != "api_key_hash"} for row in apis}
     return {
         "range": range_name,
         "summary": dict(total),
         "accounts": [dict(x) for x in accounts],
         "models": [dict(x) for x in models],
         "hours": [dict(x) for x in hours],
+        "apis": configured_api_summaries(api_stats, cfg["cliproxy_config_path"]),
     }
 
 
@@ -458,11 +570,14 @@ def latest_quotas(force=False):
 
 
 def recent_requests(limit=100):
+    cfg = load_config()
+    api_labels = configured_api_label_by_hash(cfg["cliproxy_config_path"])
     with db_connect() as conn:
         rows = conn.execute(
             """
             SELECT timestamp, source, auth_index, model, endpoint, failed, latency_ms,
-                   input_tokens, output_tokens, reasoning_tokens, cached_tokens, total_tokens, request_id
+                   input_tokens, output_tokens, reasoning_tokens, cached_tokens, total_tokens,
+                   request_id, api_key_hash
             FROM usage_events ORDER BY ts_epoch DESC LIMIT ?
             """,
             (limit,),
@@ -471,6 +586,8 @@ def recent_requests(limit=100):
     for row in rows:
         item = dict(row)
         item["local_time"] = parse_rfc3339(item["timestamp"]).astimezone(LOCAL_TZ).strftime("%Y-%m-%d %H:%M:%S")
+        key_hash = item.get("api_key_hash") or ""
+        item["api_label"] = api_labels.get(key_hash, "unknown" if not key_hash else "hash******" + key_hash[-4:])
         result.append(item)
     return result
 
@@ -538,6 +655,7 @@ DASHBOARD_HTML = r"""<!doctype html>
     .kpis { grid-template-columns: repeat(5, minmax(150px, 1fr)); }
     .two { grid-template-columns: 1.2fr .8fr; margin-top:14px; }
     .panel { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:14px; min-width:0; }
+    .chart-stack .hour-panel { grid-column:1 / -1; }
     .panel h2 { margin:0 0 12px; font-size:15px; }
     .kpi .label { color:var(--muted); font-size:12px; }
     .kpi .value { font-size:24px; font-weight:700; margin-top:6px; }
@@ -548,6 +666,9 @@ DASHBOARD_HTML = r"""<!doctype html>
     td.num, th.num { text-align:right; }
     .scroll { overflow:auto; max-height:420px; }
     .status { display:inline-flex; align-items:center; gap:6px; }
+    .request-status { font-weight:600; }
+    .request-status.success { color:var(--green); }
+    .request-status.failed { color:var(--red); }
     .dot { width:8px; height:8px; border-radius:50%; display:inline-block; background:var(--green); }
     .dot.bad { background:var(--red); }
     .muted { color:var(--muted); }
@@ -556,6 +677,15 @@ DASHBOARD_HTML = r"""<!doctype html>
     .bar > span { display:block; height:100%; background:var(--green); }
     .bar > span.warn { background:var(--amber); }
     .bar > span.bad { background:var(--red); }
+    .api-panel { min-height:302px; }
+    .api-list { display:grid; gap:10px; max-height:260px; overflow:auto; padding-right:2px; }
+    .api-card { position:relative; border:1px solid var(--line); border-radius:6px; padding:12px; background:#fbfaf7; }
+    .api-key { font-weight:700; margin-bottom:8px; }
+    .api-metrics { display:flex; gap:6px; flex-wrap:wrap; color:var(--muted); font-size:12px; }
+    .api-pill { display:inline-flex; align-items:center; gap:4px; border-radius:999px; background:#f0f1ed; padding:4px 8px; }
+    .api-success { color:var(--green); }
+    .api-failed { color:var(--red); }
+    .api-empty { color:var(--muted); padding:20px 0; }
     @media (max-width: 900px) { .kpis, .two { grid-template-columns:1fr; } header { align-items:flex-start; flex-direction:column; } }
   </style>
 </head>
@@ -583,26 +713,33 @@ DASHBOARD_HTML = r"""<!doctype html>
       <div class="panel kpi"><div class="label">输出 Tokens</div><div class="value" id="kOut">0</div><div class="sub">模型回复</div></div>
       <div class="panel kpi"><div class="label">推理 Tokens</div><div class="value" id="kReason">0</div><div class="sub">reasoning</div></div>
     </section>
-    <section class="grid two">
-      <div class="panel"><h2>按小时消耗</h2><canvas id="hourChart" width="900" height="260"></canvas></div>
-      <div class="panel"><h2>模型消耗</h2><canvas id="modelChart" width="520" height="260"></canvas></div>
+    <section class="grid two chart-stack">
+      <div class="panel hour-panel"><h2>按小时消耗</h2><canvas id="hourChart" width="900" height="260"></canvas></div>
+      <div class="panel api-panel"><h2>API 详细统计</h2><div class="api-list" id="apiDetails"></div></div>
+      <div class="panel model-panel"><h2>模型消耗</h2><canvas id="modelChart" width="520" height="260"></canvas></div>
     </section>
     <section class="grid two">
       <div class="panel"><h2>账号消耗</h2><div class="scroll"><table><thead><tr><th>账号</th><th class="num">请求</th><th class="num">总 Token</th><th class="num">输入</th><th class="num">输出</th><th class="num">推理</th><th class="num">失败</th></tr></thead><tbody id="accounts"></tbody></table></div></div>
       <div class="panel"><h2>账号余量</h2><div class="scroll"><table><thead><tr><th>账号</th><th>状态</th><th>5h 剩余</th><th>7d 剩余</th><th>重置时间</th></tr></thead><tbody id="quotas"></tbody></table></div></div>
     </section>
-    <section class="panel" style="margin-top:14px"><h2>最近每次请求/任务</h2><div class="scroll"><table><thead><tr><th>时间</th><th>账号</th><th>模型</th><th class="num">总 Token</th><th class="num">输入</th><th class="num">输出</th><th class="num">推理</th><th class="num">耗时</th><th>状态</th></tr></thead><tbody id="requests"></tbody></table></div></section>
+    <section class="panel" style="margin-top:14px"><h2>最近每次请求/任务</h2><div class="scroll"><table><thead><tr><th>时间</th><th>账号</th><th>API</th><th>模型</th><th class="num">总 Token</th><th class="num">输入</th><th class="num">输出</th><th class="num">推理</th><th class="num">耗时</th><th>状态</th></tr></thead><tbody id="requests"></tbody></table></div></section>
   </main>
 <script>
 const nf = new Intl.NumberFormat('zh-CN');
 const $ = id => document.getElementById(id);
 function fmt(n){ return nf.format(n || 0); }
+function compact(n){
+  const value = Number(n || 0);
+  if (value >= 1000000) return (value / 1000000).toFixed(value >= 10000000 ? 0 : 1).replace(/\.0$/, '') + 'M';
+  if (value >= 1000) return (value / 1000).toFixed(value >= 10000 ? 0 : 1).replace(/\.0$/, '') + 'K';
+  return fmt(value);
+}
 function esc(s){ return String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 async function getJSON(url){ const r = await fetch(url); if(!r.ok) throw new Error(await r.text()); return r.json(); }
 function drawBars(canvas, rows, labelKey, valueKey, color){
   const ctx = canvas.getContext('2d'), w = canvas.width, h = canvas.height;
   ctx.clearRect(0,0,w,h); ctx.font = '12px -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif';
-  const pad = {l:52,r:18,t:12,b:44}; const max = Math.max(1, ...rows.map(r => Number(r[valueKey] || 0)));
+  const pad = {l:52,r:18,t:30,b:44}; const max = Math.max(1, ...rows.map(r => Number(r[valueKey] || 0)));
   const bw = Math.max(12, (w-pad.l-pad.r) / Math.max(1, rows.length) * .62);
   rows.forEach((r,i) => {
     const x = pad.l + i * ((w-pad.l-pad.r) / Math.max(1, rows.length)) + bw*.3;
@@ -612,7 +749,7 @@ function drawBars(canvas, rows, labelKey, valueKey, color){
     ctx.fillStyle = '#667085'; ctx.textAlign = 'center';
     const label = String(r[labelKey] || '').slice(-5);
     ctx.fillText(label, x+bw/2, h-18);
-    if (bh > 18) { ctx.fillStyle = '#17202a'; ctx.fillText(fmt(r[valueKey]), x+bw/2, y-5); }
+    if (bh > 18) { ctx.fillStyle = '#17202a'; ctx.fillText(fmt(r[valueKey]), x+bw/2, Math.max(14, y-7)); }
   });
   ctx.strokeStyle = '#d9dee7'; ctx.beginPath(); ctx.moveTo(pad.l,h-pad.b); ctx.lineTo(w-pad.r,h-pad.b); ctx.stroke();
 }
@@ -631,6 +768,21 @@ function quotaBar(v){
   const cls = v <= 10 ? 'bad' : (v <= 30 ? 'warn' : '');
   return `<div class="bar"><span class="${cls}" style="width:${Math.max(0, Math.min(100, v))}%"></span></div><span>${v}%</span>`;
 }
+function renderApis(rows){
+  if (!rows || !rows.length) {
+    $('apiDetails').innerHTML = '<div class="api-empty">暂无 API 数据</div>';
+    return;
+  }
+  $('apiDetails').innerHTML = rows.map(api => `
+    <div class="api-card">
+      <div class="api-key">${esc(api.label || 'unknown')}</div>
+      <div class="api-metrics">
+        <span class="api-pill">请求次数: ${fmt(api.requests)} <span class="api-success">(${fmt(api.succeeded)}</span><span class="api-failed">${fmt(api.failed)})</span></span>
+        <span class="api-pill">Token数量: ${compact(api.total_tokens)}</span>
+      </div>
+    </div>
+  `).join('');
+}
 async function load(forceQuota=false){
   const range = $('range').value;
   const [summary, quota, reqs] = await Promise.all([
@@ -644,7 +796,8 @@ async function load(forceQuota=false){
   $('kOut').textContent = fmt(s.output_tokens); $('kReason').textContent = fmt(s.reasoning_tokens);
   $('accounts').innerHTML = summary.accounts.map(a => `<tr><td>${esc(a.account)}</td><td class="num">${fmt(a.requests)}</td><td class="num">${fmt(a.total_tokens)}</td><td class="num">${fmt(a.input_tokens)}</td><td class="num">${fmt(a.output_tokens)}</td><td class="num">${fmt(a.reasoning_tokens)}</td><td class="num">${fmt(a.failed)}</td></tr>`).join('');
   $('quotas').innerHTML = quota.quotas.map(q => `<tr><td>${esc(q.email)}</td><td><span class="status"><span class="dot ${q.allowed ? '' : 'bad'}"></span>${q.allowed ? '可用' : '受限'}</span></td><td>${quotaBar(q.primary_remaining_percent)}</td><td>${quotaBar(q.secondary_remaining_percent)}</td><td><div>${esc(q.primary_reset_at)}</div><div class="muted">${esc(q.secondary_reset_at)}</div></td></tr>`).join('');
-  $('requests').innerHTML = reqs.requests.map(r => `<tr><td>${esc(r.local_time)}</td><td>${esc(r.source || r.auth_index)}</td><td>${esc(r.model)}</td><td class="num">${fmt(r.total_tokens)}</td><td class="num">${fmt(r.input_tokens)}</td><td class="num">${fmt(r.output_tokens)}</td><td class="num">${fmt(r.reasoning_tokens)}</td><td class="num">${fmt(r.latency_ms)}ms</td><td>${r.failed ? '失败' : '成功'}</td></tr>`).join('');
+  $('requests').innerHTML = reqs.requests.map(r => `<tr><td>${esc(r.local_time)}</td><td>${esc(r.source || r.auth_index)}</td><td>${esc(r.api_label)}</td><td>${esc(r.model)}</td><td class="num">${fmt(r.total_tokens)}</td><td class="num">${fmt(r.input_tokens)}</td><td class="num">${fmt(r.output_tokens)}</td><td class="num">${fmt(r.reasoning_tokens)}</td><td class="num">${fmt(r.latency_ms)}ms</td><td><span class="request-status ${r.failed ? 'failed' : 'success'}">${r.failed ? '失败' : '成功'}</span></td></tr>`).join('');
+  renderApis(summary.apis);
   drawBars($('hourChart'), summary.hours, 'hour', 'total_tokens', '#2563eb');
   drawHorizontal($('modelChart'), summary.models);
   $('updated').textContent = '更新于 ' + new Date().toLocaleTimeString('zh-CN');
