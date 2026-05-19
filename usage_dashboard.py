@@ -651,6 +651,40 @@ DASHBOARD_HTML = r"""<!doctype html>
     button, select { border:1px solid var(--line); background:#fff; color:var(--text); border-radius:6px; padding:8px 10px; font-size:14px; }
     button.primary { background:var(--blue); color:#fff; border-color:var(--blue); }
     .toolbar { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
+    .date-filter { position:relative; }
+    .date-filter-control { position:relative; }
+    .date-filter-trigger { height:38px; min-width:218px; display:flex; align-items:center; justify-content:flex-start; gap:8px; padding:8px 32px 8px 12px; background:#fff; border-radius:4px; }
+    .date-filter-trigger[aria-expanded="true"] { border-color:#2684ff; box-shadow:0 0 0 2px rgba(38, 132, 255, .12); }
+    .date-filter-icon { flex:none; width:14px; height:14px; color:#b8c2d2; }
+    .date-filter-value { max-width:154px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-weight:400; color:#344054; }
+    .date-filter-clear { position:absolute; top:50%; right:8px; width:18px; height:18px; display:flex; align-items:center; justify-content:center; transform:translateY(-50%); border:0; border-radius:50%; padding:0; background:transparent; color:#98a2b3; font-size:18px; line-height:1; opacity:0; }
+    .date-filter-clear[hidden] { display:none; }
+    .date-filter-trigger.has-value + .date-filter-clear { display:flex; }
+    .date-filter-control:hover .date-filter-clear, .date-filter-control:focus-within .date-filter-clear { opacity:1; }
+    .date-filter-clear:hover { color:#667085; background:#eef2f7; }
+    .date-filter-popover { position:absolute; left:0; top:calc(100% + 8px); width:438px; min-height:302px; padding:0; display:grid; grid-template-columns:110px minmax(0, 1fr); background:#fff; border:1px solid var(--line); border-radius:3px; box-shadow:0 12px 30px rgba(15, 23, 42, .14); z-index:5; }
+    .date-filter-popover::before { content:""; position:absolute; top:-6px; left:40px; width:10px; height:10px; background:#fff; border-left:1px solid var(--line); border-top:1px solid var(--line); transform:rotate(45deg); }
+    .date-filter-popover[hidden] { display:none; }
+    .date-filter-menu { padding:18px 10px; border-right:1px solid var(--line); display:grid; align-content:start; gap:6px; background:#fff; }
+    .date-filter-menu button { display:flex; align-items:center; justify-content:center; border:1px solid transparent; border-radius:3px; height:34px; background:transparent; color:#1f2937; font-weight:400; line-height:1; letter-spacing:0; }
+    .date-filter-menu button.active { background:#eef6ff; color:#1f2937; box-shadow:none; }
+    .date-filter-panel { min-width:0; display:flex; flex-direction:column; background:#fff; }
+    .date-filter-head { display:grid; grid-template-columns:32px 32px 1fr 32px 32px; align-items:center; gap:2px; padding:11px 14px 8px; }
+    .date-filter-head.compact { grid-template-columns:32px 1fr 32px; }
+    .date-filter-head strong { text-align:center; font-size:16px; font-weight:500; }
+    .date-nav { width:28px; height:28px; padding:0; border:0; background:#fff; color:#4a5568; font-size:18px; line-height:1; }
+    .date-nav:hover { color:var(--blue); background:#f4f8ff; }
+    .date-filter-grid { flex:1; display:grid; padding:0 16px 14px; }
+    .date-filter-grid.day { grid-template-columns:repeat(7, minmax(0, 1fr)); grid-auto-rows:36px; }
+    .date-filter-grid.month, .date-filter-grid.year { grid-template-columns:repeat(4, minmax(0, 1fr)); grid-auto-rows:64px; padding-top:8px; }
+    .date-weekday, .date-cell { min-width:0; display:flex; align-items:center; justify-content:center; font-size:12px; }
+    .date-filter-grid.month .date-cell, .date-filter-grid.year .date-cell { font-family:inherit; font-size:12px; font-weight:400; line-height:1; }
+    .date-weekday { color:#344054; font-weight:500; }
+    .date-cell { width:100%; height:32px; margin:auto; border:1px solid transparent; border-radius:0; background:transparent; cursor:pointer; padding:0; color:#2f3a4a; }
+    .date-cell:hover { color:var(--blue); background:#f2f7ff; }
+    .date-cell.outside { color:#aab4c3; background:#f6f8fb; }
+    .date-cell.today:not(.selected) { color:#1677ff; font-weight:700; }
+    .date-cell.selected { width:72%; border-radius:4px; color:#1677ff; border-color:transparent; background:#eef6ff; box-shadow:none; font-weight:400; }
     .grid { display:grid; gap:14px; }
     .kpis { grid-template-columns: repeat(5, minmax(150px, 1fr)); }
     .two { grid-template-columns: 1.2fr .8fr; margin-top:14px; }
@@ -686,13 +720,42 @@ DASHBOARD_HTML = r"""<!doctype html>
     .api-success { color:var(--green); }
     .api-failed { color:var(--red); }
     .api-empty { color:var(--muted); padding:20px 0; }
-    @media (max-width: 900px) { .kpis, .two { grid-template-columns:1fr; } header { align-items:flex-start; flex-direction:column; } }
+    @media (max-width: 900px) { .kpis, .two { grid-template-columns:1fr; } header { align-items:flex-start; flex-direction:column; } .date-filter-popover { width:min(438px, calc(100vw - 48px)); grid-template-columns:74px minmax(0, 1fr); } .date-filter-menu { padding-top:14px; } }
   </style>
 </head>
 <body>
   <header>
     <h1>CLIProxyAPI 用量统计</h1>
     <div class="toolbar">
+      <div class="date-filter" id="dateFilter">
+        <div class="date-filter-control">
+          <button type="button" class="date-filter-trigger" id="dateFilterTrigger" aria-expanded="false" aria-controls="dateFilterPopover">
+            <svg class="date-filter-icon" viewBox="0 0 16 16" aria-hidden="true">
+              <rect x="2.5" y="3.5" width="11" height="10" rx="1" fill="none" stroke="currentColor"/>
+              <path d="M2.5 6.5h11M5 2.5v3M11 2.5v3M5 8.5h1.5M7.25 8.5h1.5M9.5 8.5H11M5 10.75h1.5M7.25 10.75h1.5M9.5 10.75H11" fill="none" stroke="currentColor" stroke-linecap="round"/>
+            </svg>
+            <span class="date-filter-value" id="dateFilterSelection"></span>
+          </button>
+          <button type="button" class="date-filter-clear" id="dateFilterClear" aria-label="清除日期筛选" hidden>&times;</button>
+        </div>
+        <div class="date-filter-popover" id="dateFilterPopover" hidden>
+          <div class="date-filter-menu" aria-label="日期粒度">
+            <button type="button" data-view="day">日</button>
+            <button type="button" data-view="month">月</button>
+            <button type="button" data-view="year">年</button>
+          </div>
+          <div class="date-filter-panel">
+            <div class="date-filter-head" id="dateFilterHead">
+              <button type="button" class="date-nav" data-shift="year-prev" aria-label="上一年">&laquo;</button>
+              <button type="button" class="date-nav" data-shift="month-prev" aria-label="上一月">&lsaquo;</button>
+              <strong id="dateFilterTitle"></strong>
+              <button type="button" class="date-nav" data-shift="month-next" aria-label="下一月">&rsaquo;</button>
+              <button type="button" class="date-nav" data-shift="year-next" aria-label="下一年">&raquo;</button>
+            </div>
+            <div class="date-filter-grid" id="dateFilterGrid"></div>
+          </div>
+        </div>
+      </div>
       <select id="range">
         <option value="today">今天</option>
         <option value="1h">最近 1 小时</option>
@@ -736,6 +799,150 @@ function compact(n){
 }
 function esc(s){ return String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 async function getJSON(url){ const r = await fetch(url); if(!r.ok) throw new Error(await r.text()); return r.json(); }
+const today = new Date();
+let calendarView = 'day';
+let visibleDate = new Date(today.getFullYear(), today.getMonth(), 1);
+let selectedPeriod = {type:'day', key: dateKey(today), label: dateKey(today)};
+function pad2(n){ return String(n).padStart(2, '0'); }
+function dateKey(date){ return `${date.getFullYear()}-${pad2(date.getMonth() + 1)}-${pad2(date.getDate())}`; }
+function monthKey(year, month){ return `${year}-${pad2(month + 1)}`; }
+function yearKey(year){ return String(year); }
+function closeDateFilter(){
+  $('dateFilterPopover').hidden = true;
+  $('dateFilterTrigger').setAttribute('aria-expanded', 'false');
+}
+function updateDateFilterTrigger(){
+  const trigger = $('dateFilterTrigger');
+  const clear = $('dateFilterClear');
+  $('dateFilterSelection').textContent = selectedPeriod ? selectedPeriod.label : '选择日期';
+  trigger.classList.toggle('has-value', Boolean(selectedPeriod));
+  clear.hidden = !selectedPeriod;
+}
+function setCalendarView(view){
+  calendarView = view;
+  document.querySelectorAll('[data-view]').forEach(btn => btn.classList.toggle('active', btn.dataset.view === view));
+  renderDateFilter();
+}
+function shiftCalendar(shift){
+  const year = visibleDate.getFullYear();
+  const month = visibleDate.getMonth();
+  if (calendarView === 'day') {
+    if (shift === 'year-prev') visibleDate = new Date(year - 1, month, 1);
+    if (shift === 'year-next') visibleDate = new Date(year + 1, month, 1);
+    if (shift === 'month-prev') visibleDate = new Date(year, month - 1, 1);
+    if (shift === 'month-next') visibleDate = new Date(year, month + 1, 1);
+  } else if (calendarView === 'month') {
+    if (shift.endsWith('prev')) visibleDate = new Date(year - 1, month, 1);
+    if (shift.endsWith('next')) visibleDate = new Date(year + 1, month, 1);
+  } else if (calendarView === 'year') {
+    if (shift.endsWith('prev')) visibleDate = new Date(year - 10, month, 1);
+    if (shift.endsWith('next')) visibleDate = new Date(year + 10, month, 1);
+  }
+  renderDateFilter();
+}
+function pickDay(key){
+  const [year, month] = key.split('-').map(Number);
+  selectedPeriod = {type:'day', key, label:key};
+  visibleDate = new Date(year, month - 1, 1);
+  updateDateFilterTrigger();
+  renderDateFilter();
+}
+function pickMonth(month){
+  const year = visibleDate.getFullYear();
+  const key = monthKey(year, month);
+  selectedPeriod = {type:'month', key, label:key};
+  visibleDate = new Date(year, month, 1);
+  updateDateFilterTrigger();
+  renderDateFilter();
+}
+function pickYear(year){
+  const key = yearKey(year);
+  selectedPeriod = {type:'year', key, label:key};
+  visibleDate = new Date(year, visibleDate.getMonth(), 1);
+  updateDateFilterTrigger();
+  renderDateFilter();
+}
+function renderDayGrid(grid){
+  const year = visibleDate.getFullYear();
+  const month = visibleDate.getMonth();
+  const weekdays = ['日','一','二','三','四','五','六'];
+  const firstDay = new Date(year, month, 1).getDay();
+  const gridStart = new Date(year, month, 1 - firstDay);
+  $('dateFilterTitle').textContent = `${year} 年 ${month + 1} 月`;
+  $('dateFilterHead').classList.remove('compact');
+  document.querySelectorAll('[data-shift^="month"]').forEach(btn => btn.hidden = false);
+  grid.className = 'date-filter-grid day';
+  grid.innerHTML = weekdays.map(day => `<div class="date-weekday">${day}</div>`).join('');
+  for (let i = 0; i < 42; i++) {
+    const date = new Date(gridStart.getFullYear(), gridStart.getMonth(), gridStart.getDate() + i);
+    const key = dateKey(date);
+    const classes = ['date-cell'];
+    if (key === dateKey(today)) classes.push('today');
+    if (selectedPeriod?.type === 'day' && selectedPeriod.key === key) classes.push('selected');
+    if (date.getMonth() !== month) classes.push('outside');
+    grid.insertAdjacentHTML('beforeend', `<button type="button" class="${classes.join(' ')}" data-date="${key}">${date.getDate()}</button>`);
+  }
+}
+function renderMonthGrid(grid){
+  const year = visibleDate.getFullYear();
+  const labels = ['一月','二月','三月','四月','五月','六月','七月','八月','九月','十月','十一月','十二月'];
+  $('dateFilterTitle').textContent = `${year}年`;
+  $('dateFilterHead').classList.add('compact');
+  document.querySelectorAll('[data-shift^="month"]').forEach(btn => btn.hidden = true);
+  grid.className = 'date-filter-grid month';
+  grid.innerHTML = labels.map((label, month) => {
+    const active = selectedPeriod?.type === 'month' && selectedPeriod.key === monthKey(year, month) ? ' selected' : '';
+    return `<button type="button" class="date-cell${active}" data-month="${month}">${label}</button>`;
+  }).join('');
+}
+function renderYearGrid(grid){
+  const currentYear = visibleDate.getFullYear();
+  const startYear = Math.floor(currentYear / 10) * 10;
+  $('dateFilterTitle').textContent = `${startYear}年 - ${startYear + 9}年`;
+  $('dateFilterHead').classList.add('compact');
+  document.querySelectorAll('[data-shift^="month"]').forEach(btn => btn.hidden = true);
+  grid.className = 'date-filter-grid year';
+  grid.innerHTML = Array.from({length:10}, (_, i) => {
+    const year = startYear + i;
+    const active = selectedPeriod?.type === 'year' && selectedPeriod.key === yearKey(year) ? ' selected' : '';
+    return `<button type="button" class="date-cell${active}" data-year="${year}">${year}</button>`;
+  }).join('');
+}
+function renderDateFilter(){
+  const grid = $('dateFilterGrid');
+  if (calendarView === 'year') renderYearGrid(grid);
+  if (calendarView === 'month') renderMonthGrid(grid);
+  if (calendarView === 'day') renderDayGrid(grid);
+}
+function initDateFilter(){
+  $('dateFilterTrigger').onclick = () => {
+    const popover = $('dateFilterPopover');
+    popover.hidden = !popover.hidden;
+    $('dateFilterTrigger').setAttribute('aria-expanded', String(!popover.hidden));
+    renderDateFilter();
+  };
+  document.querySelectorAll('[data-shift]').forEach(btn => btn.onclick = () => shiftCalendar(btn.dataset.shift));
+  document.querySelectorAll('[data-view]').forEach(btn => btn.onclick = () => setCalendarView(btn.dataset.view));
+  $('dateFilterClear').onclick = event => {
+    event.stopPropagation();
+    selectedPeriod = null;
+    updateDateFilterTrigger();
+    renderDateFilter();
+  };
+  $('dateFilterGrid').onclick = event => {
+    const target = event.target.closest('button');
+    if (!target) return;
+    if (target.dataset.date) pickDay(target.dataset.date);
+    if (target.dataset.month) pickMonth(Number(target.dataset.month));
+    if (target.dataset.year) pickYear(Number(target.dataset.year));
+  };
+  document.addEventListener('click', event => {
+    if ($('dateFilter').contains(event.target)) return;
+    closeDateFilter();
+  });
+  updateDateFilterTrigger();
+  setCalendarView('day');
+}
 function drawBars(canvas, rows, labelKey, valueKey, color){
   const ctx = canvas.getContext('2d'), w = canvas.width, h = canvas.height;
   ctx.clearRect(0,0,w,h); ctx.font = '12px -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif';
@@ -805,6 +1012,7 @@ async function load(forceQuota=false){
 $('refresh').onclick = () => load(false);
 $('quota').onclick = () => load(true);
 $('range').onchange = () => load(false);
+initDateFilter();
 load(false); setInterval(() => load(false), 30000);
 </script>
 </body>
