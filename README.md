@@ -128,7 +128,7 @@ redis-usage-queue-retention-seconds: 3600
 ```bash
 mkdir -p ~/.cli-proxy-api/usage-dashboard
 cp usage_dashboard.py ~/.cli-proxy-api/usage-dashboard/
-cp config.example.json ~/.cli-proxy-api/usage-dashboard/config.json
+cp config.json ~/.cli-proxy-api/usage-dashboard/config.json
 chmod 700 ~/.cli-proxy-api/usage-dashboard
 chmod 600 ~/.cli-proxy-api/usage-dashboard/config.json
 ```
@@ -272,7 +272,7 @@ GET /api/requests?limit=100
 
 其中：
 
-- `config.json` 包含本地管理密钥，不能提交。
+- 运行目录中的 `config.json` 包含本地管理密钥，不能提交；仓库根目录的 `config.json` 是脱敏模板。
 - `usage.sqlite` 包含账号名和用量统计，不能提交。
 - `logs/` 可能包含运行错误信息，不能提交。
 
@@ -285,7 +285,8 @@ GET /api/requests?limit=100
 - OAuth `access_token`
 - OAuth `refresh_token`
 - OAuth `id_token`
-- 本地 `config.json`
+- 本地运行目录中的 `config.json`（仓库根目录模板除外）
+- 本地临时备份 `config.local.json`
 - SQLite 数据库
 - 日志文件
 - 真实账号邮箱
@@ -293,7 +294,8 @@ GET /api/requests?limit=100
 本仓库的 `.gitignore` 默认排除：
 
 ```text
-config.json
+config.local.json
+/~/
 *.sqlite
 *.sqlite-shm
 *.sqlite-wal

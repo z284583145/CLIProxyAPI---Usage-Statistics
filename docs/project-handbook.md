@@ -23,6 +23,7 @@
 cliproxyapi-usage-dashboard/
   README.md
   usage_dashboard.py
+  config.json
   run_collector.cmd
   .gitignore
   docs/
@@ -37,6 +38,7 @@ cliproxyapi-usage-dashboard/
 
 - `README.md`：面向使用者的安装、运行和安全说明。
 - `usage_dashboard.py`：项目主程序，包含采集、存储、接口和前端页面。
+- `config.json`：脱敏配置模板，可复制到运行目录后填入本机密钥。
 - `run_collector.cmd`：Windows 下启动采集器并写入本地日志的辅助脚本。
 - `docs/dashboard-preview.svg`：脱敏预览图。
 - `docs/project-handbook.md`：面向维护和需求变更的项目文档。
@@ -44,7 +46,8 @@ cliproxyapi-usage-dashboard/
 
 本地运行过程中会生成或使用以下敏感文件，不能提交：
 
-- `config.json`
+- 运行目录中的 `config.json`
+- 仓库根目录中的 `config.local.json`
 - `*.sqlite`
 - `*.sqlite-shm`
 - `*.sqlite-wal`
@@ -497,7 +500,8 @@ git grep -n -I "refresh_token\|id_token\|gho_\|Bearer [A-Za-z0-9]\|chatgpt_accou
 
 提交前确认：
 
-- 没有提交 `config.json`。
+- 没有提交真实配置 `config.local.json` 或运行目录中的 `config.json`。
+- 仓库根目录的 `config.json` 只包含脱敏占位值。
 - 没有提交 `usage.sqlite`。
 - 没有提交 `logs/`。
 - 没有提交真实账号邮箱、API key、OAuth token。

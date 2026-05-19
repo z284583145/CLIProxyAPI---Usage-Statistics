@@ -1,4 +1,5 @@
-config.json
+config.local.json
+/~/
 *.sqlite
 *.sqlite-shm
 *.sqlite-wal
