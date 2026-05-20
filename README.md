@@ -5,8 +5,8 @@
 它会持续从 CLIProxyAPI 的 Redis 兼容用量队列中采集每次请求记录，写入本地 SQLite，并通过网页展示：
 
 - 每次任务/请求的 token 消耗
-- 今日总消耗
-- 最近 1 小时、5 小时、24 小时、7 天消耗
+- 按日、月、年筛选的总消耗
+- 日视图按 24 小时、月视图按自然日、年视图按 12 个月展示的柱状图
 - 按账号统计的请求数、token 消耗和失败数
 - 按模型统计的 token 消耗
 - Codex / ChatGPT 账号的 5 小时与 7 天余量
@@ -87,15 +87,19 @@ sequenceDiagram
 - 耗时：`latency_ms`
 - token：`input_tokens`、`output_tokens`、`reasoning_tokens`、`cached_tokens`、`total_tokens`
 
-### 时间窗口
+### 日期筛选
 
-网页面板支持以下窗口：
+网页面板使用顶部日期选择器作为统计数据的主筛选控件：
 
-- 今天：从本地时区当天 00:00 开始
-- 最近 1 小时
-- 最近 5 小时
-- 最近 24 小时
-- 最近 7 天
+- 选择“日”：统计本地时区这一天 00:00 到次日 00:00 前的数据，柱状图固定显示 24 根柱子。
+- 选择“月”：统计这个自然月的数据，柱状图按当月天数显示，例如 28、29、30 或 31 根柱子。
+- 选择“年”：统计这一整年数据，柱状图固定显示 12 根柱子，每月一根。
+
+日视图会压缩左侧 `00:00` 到 `07:00` 的弱化区间，让 `08:00` 到 `24:00` 前的正常显示区占据主要宽度。
+
+柱状图顶部的 token 数值会使用 `K` / `M` 紧凑格式，并对相邻标签做避让绘制，避免大数字挤在一起影响阅读；完整数值仍可在明细表和接口响应中查看。
+
+日期选择器会刷新 KPI、账号消耗、API 统计、模型消耗、主柱状图和“最近每次请求/任务”；不会影响“账号余量”。
 
 ### 账号余量
 
@@ -106,6 +110,13 @@ sequenceDiagram
 - 7 天窗口已用百分比和剩余百分比
 - 对应窗口的重置时间
 - credits balance
+
+账号余量刷新策略：
+
+- 采集器每 `quota_refresh_seconds` 秒自动刷新一次真实余量，默认是 14,400 秒（4 小时）。
+- 网页面板的普通刷新会请求 `/api/quota`；如果本地快照仍在 4 小时有效期内，只返回本地数据库快照。
+- 如果没有快照，或最新快照已经超过 4 小时，普通 `/api/quota` 会触发一次真实刷新。
+- 账号余量面板内的刷新按钮请求 `/api/quota?force=1`，会强制刷新真实余量。
 
 ## 前置条件
 
@@ -278,20 +289,23 @@ python3 ~/.cli-proxy-api/usage-dashboard/usage_dashboard.py quota --force
 
 ```text
 GET /api/health
-GET /api/summary?range=today
-GET /api/summary?range=5h
+GET /api/summary?period_type=day&period_key=2026-05-19
+GET /api/summary?period_type=month&period_key=2026-05
+GET /api/summary?period_type=year&period_key=2026
 GET /api/quota
 GET /api/quota?force=1
-GET /api/requests?limit=100
+GET /api/requests?limit=100&period_type=day&period_key=2026-05-19
 ```
 
-`range` 支持：
+`period_type` 支持：
 
-- `today`
-- `1h`
-- `5h`
-- `24h`
-- `7d`
+- `day`：`period_key` 格式为 `YYYY-MM-DD`
+- `month`：`period_key` 格式为 `YYYY-MM`
+- `year`：`period_key` 格式为 `YYYY`
+
+为了兼容命令行报表和旧调用，`/api/summary?range=today|1h|5h|24h|7d` 仍然可用；网页面板使用新的 `period_type` / `period_key` 参数。
+
+`/api/requests` 也支持同样的 `period_type` / `period_key` 参数，用于让“最近每次请求/任务”跟随日期选择器过滤；不传时返回全局最新请求。
 
 ## 数据文件
 

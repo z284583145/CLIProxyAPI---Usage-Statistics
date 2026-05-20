@@ -1,4 +1,5 @@
 from pathlib import Path
+import datetime as dt
 import re
 import tempfile
 import unittest
@@ -13,11 +14,13 @@ class DashboardHtmlTest(unittest.TestCase):
     def setUp(self):
         self.html = usage_dashboard.DASHBOARD_HTML
 
-    def test_date_filter_controls_render_before_range_select(self):
-        date_filter_pos = self.html.index('class="date-filter"')
-        range_pos = self.html.index('id="range"')
-
-        self.assertLess(date_filter_pos, range_pos)
+    def test_date_filter_controls_render_without_legacy_range_select(self):
+        self.assertIn('class="date-filter"', self.html)
+        self.assertNotIn('id="range"', self.html)
+        self.assertNotIn('最近 1 小时', self.html)
+        self.assertNotIn('最近 5 小时', self.html)
+        self.assertNotIn('最近 24 小时', self.html)
+        self.assertNotIn('最近 7 天', self.html)
         self.assertIn('class="date-filter-menu"', self.html)
         self.assertRegex(
             self.html,
@@ -123,16 +126,20 @@ class DashboardHtmlTest(unittest.TestCase):
             r"\.date-filter-grid\.month \.date-cell, \.date-filter-grid\.year \.date-cell \{[^}]*font-family:inherit;[^}]*font-size:12px;[^}]*font-weight:400;[^}]*line-height:1;",
         )
 
-    def test_date_filter_is_local_ui_only(self):
+    def test_date_filter_drives_summary_api_and_reload(self):
         self.assertIn("let selectedPeriod", self.html)
         self.assertIn("function setCalendarView", self.html)
+        self.assertIn("function summaryUrl()", self.html)
+        self.assertIn("period_type=", self.html)
+        self.assertIn("period_key=", self.html)
+        self.assertIn("if (target.dataset.date) pickDay(target.dataset.date);", self.html)
+        self.assertIn("if (target.dataset.month) pickMonth(Number(target.dataset.month));", self.html)
+        self.assertIn("if (target.dataset.year) pickYear(Number(target.dataset.year));", self.html)
+        self.assertRegex(self.html, r"function pickDay\(key\)[\s\S]+load\(\);")
+        self.assertRegex(self.html, r"function pickMonth\(month\)[\s\S]+load\(\);")
+        self.assertRegex(self.html, r"function pickYear\(year\)[\s\S]+load\(\);")
 
-        summary_url_match = re.search(
-            r"getJSON\('/api/summary\?range=' \+ encodeURIComponent\(range\)\)",
-            self.html,
-        )
-        self.assertIsNotNone(summary_url_match)
-        self.assertNotRegex(self.html, r"/api/summary\?[^']*date")
+        self.assertNotIn("getJSON('/api/summary?range='", self.html)
 
     def test_header_shows_collector_status_and_removes_quota_update_controls(self):
         date_filter_pos = self.html.index('class="date-filter"')
@@ -170,6 +177,46 @@ class DashboardHtmlTest(unittest.TestCase):
         self.assertNotIn("load(true)", self.html)
         self.assertEqual(usage_dashboard.DEFAULT_CONFIG["quota_refresh_seconds"], 14400)
 
+    def test_top_refresh_button_runs_normal_load(self):
+        self.assertIn("$('refresh').onclick = () => load();", self.html)
+        self.assertNotIn("$('refresh').onclick = () => refreshQuota();", self.html)
+
+    def test_day_chart_compresses_muted_hours_and_keeps_work_hours_normal(self):
+        self.assertIn("function drawDayBars(canvas, rows)", self.html)
+        self.assertIn("const pad = {l:44,r:26,t:30,b:44};", self.html)
+        self.assertIn("const weakEnd = 8;", self.html)
+        self.assertIn("const weakW = plotW * .2;", self.html)
+        self.assertIn("const normalW = plotW - weakW;", self.html)
+        self.assertIn("drawSegment(rows.slice(0, weakEnd), pad.l, weakW, true);", self.html)
+        self.assertIn("drawSegment(rows.slice(weakEnd), pad.l + weakW, normalW, false);", self.html)
+        self.assertNotIn("const focusW = plotW - sideW * 2;", self.html)
+        self.assertNotIn("drawSegment(rows.slice(focusEnd + 1)", self.html)
+        self.assertIn("summary.period?.type === 'day'", self.html)
+        self.assertIn("if (value > 0) {", self.html)
+
+    def test_clickable_controls_use_pointer_cursor(self):
+        self.assertIn("button, select {", self.html)
+        self.assertIn("button, select, .date-cell { cursor:pointer; }", self.html)
+        self.assertIn("button:disabled, select:disabled { cursor:not-allowed; }", self.html)
+        self.assertIn(".icon-button:disabled { cursor:wait; opacity:.7; }", self.html)
+
+    def test_chart_value_labels_are_compact_and_collision_aware(self):
+        self.assertIn("function chartValueLabel(value)", self.html)
+        self.assertIn("function drawValueLabel(ctx, text, centerX, barTop, occupiedLabels)", self.html)
+        self.assertIn("ctx.measureText(text)", self.html)
+        self.assertIn("labelBoxOverlaps(box, occupiedLabels)", self.html)
+        self.assertIn("drawValueLabel(ctx, chartValueLabel(value)", self.html)
+        self.assertIn("drawValueLabel(ctx, chartValueLabel(r[valueKey])", self.html)
+        self.assertNotIn("ctx.fillText(fmt(value)", self.html)
+        self.assertNotIn("ctx.fillText(fmt(r[valueKey])", self.html)
+
+    def test_recent_requests_follow_selected_period(self):
+        self.assertIn("function requestsUrl()", self.html)
+        self.assertIn("period_type=${encodeURIComponent(period.type)}", self.html)
+        self.assertIn("period_key=${encodeURIComponent(period.key)}", self.html)
+        self.assertIn("getJSON(requestsUrl())", self.html)
+        self.assertNotIn("getJSON('/api/requests?limit=120')", self.html)
+
     def test_collector_refreshes_quota_every_four_hours(self):
         source = Path(usage_dashboard.__file__).read_text(encoding="utf-8")
         collect_body = source.split("def collect_forever():", 1)[1].split("\ndef range_bounds", 1)[0]
@@ -184,6 +231,140 @@ class DashboardHtmlTest(unittest.TestCase):
         self.assertTrue(hasattr(usage_dashboard, "collector_status"))
         self.assertTrue(hasattr(usage_dashboard, "mark_collector_success"))
         self.assertTrue(hasattr(usage_dashboard, "mark_collector_error"))
+
+
+class DashboardPeriodSummaryTest(unittest.TestCase):
+    def setUp(self):
+        self.original_base_dir = usage_dashboard.BASE_DIR
+        self.original_db_path = usage_dashboard.DB_PATH
+        self.original_config_path = usage_dashboard.CONFIG_PATH
+        self.tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        usage_dashboard.BASE_DIR = self.tmp.name
+        usage_dashboard.DB_PATH = str(Path(self.tmp.name) / "usage.sqlite")
+        usage_dashboard.CONFIG_PATH = str(Path(self.tmp.name) / "config.json")
+        Path(usage_dashboard.CONFIG_PATH).write_text(
+            '{"management_key":"","cliproxy_config_path":""}',
+            encoding="utf-8",
+        )
+        usage_dashboard.init_db()
+
+    def tearDown(self):
+        usage_dashboard.BASE_DIR = self.original_base_dir
+        usage_dashboard.DB_PATH = self.original_db_path
+        usage_dashboard.CONFIG_PATH = self.original_config_path
+        self.tmp.cleanup()
+
+    def insert_usage(self, local_time, total_tokens, event_key):
+        ts_local = local_time.replace(tzinfo=usage_dashboard.LOCAL_TZ)
+        ts_utc = ts_local.astimezone(dt.timezone.utc)
+        with usage_dashboard.db_connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO usage_events (
+                  event_key,timestamp,ts_epoch,local_date,local_hour,request_id,auth_index,source,
+                  provider,model,endpoint,auth_type,api_key_hash,failed,latency_ms,input_tokens,
+                  output_tokens,reasoning_tokens,cached_tokens,total_tokens,raw_json
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    event_key,
+                    ts_utc.isoformat(),
+                    ts_utc.timestamp(),
+                    ts_local.strftime("%Y-%m-%d"),
+                    ts_local.strftime("%Y-%m-%d %H:00"),
+                    event_key,
+                    "auth-1",
+                    "account-1",
+                    "openai",
+                    "gpt-test",
+                    "/v1/chat/completions",
+                    "api_key",
+                    "hash0001",
+                    0,
+                    120,
+                    total_tokens,
+                    0,
+                    0,
+                    0,
+                    total_tokens,
+                    "{}",
+                ),
+            )
+
+    def test_day_period_returns_24_hour_buckets_with_zero_fill(self):
+        self.insert_usage(dt.datetime(2026, 5, 19, 8, 30), 100, "day-8")
+        self.insert_usage(dt.datetime(2026, 5, 19, 18, 30), 200, "day-18")
+        self.insert_usage(dt.datetime(2026, 5, 20, 8, 30), 900, "day-outside")
+
+        summary = usage_dashboard.query_summary("day", "2026-05-19")
+
+        self.assertEqual(summary["period"]["type"], "day")
+        self.assertEqual(summary["period"]["key"], "2026-05-19")
+        self.assertEqual(summary["summary"]["total_tokens"], 300)
+        self.assertEqual(len(summary["hours"]), 24)
+        self.assertEqual(summary["hours"][0]["bucket"], "2026-05-19 00:00")
+        self.assertEqual(summary["hours"][0]["label"], "00:00")
+        self.assertEqual(summary["hours"][7]["total_tokens"], 0)
+        self.assertEqual(summary["hours"][8]["total_tokens"], 100)
+        self.assertEqual(summary["hours"][18]["total_tokens"], 200)
+        self.assertEqual(summary["hours"][23]["bucket"], "2026-05-19 23:00")
+
+    def test_month_period_returns_natural_day_buckets_with_zero_fill(self):
+        self.insert_usage(dt.datetime(2026, 5, 1, 9, 0), 100, "month-1")
+        self.insert_usage(dt.datetime(2026, 5, 31, 9, 0), 200, "month-31")
+        self.insert_usage(dt.datetime(2026, 4, 30, 9, 0), 900, "month-outside")
+
+        summary = usage_dashboard.query_summary("month", "2026-05")
+
+        self.assertEqual(summary["period"]["type"], "month")
+        self.assertEqual(summary["period"]["key"], "2026-05")
+        self.assertEqual(summary["summary"]["total_tokens"], 300)
+        self.assertEqual(len(summary["hours"]), 31)
+        self.assertEqual(summary["hours"][0]["bucket"], "2026-05-01")
+        self.assertEqual(summary["hours"][0]["total_tokens"], 100)
+        self.assertEqual(summary["hours"][1]["total_tokens"], 0)
+        self.assertEqual(summary["hours"][30]["bucket"], "2026-05-31")
+        self.assertEqual(summary["hours"][30]["total_tokens"], 200)
+
+    def test_year_period_returns_12_month_buckets_with_zero_fill(self):
+        self.insert_usage(dt.datetime(2026, 3, 10, 9, 0), 300, "year-3")
+        self.insert_usage(dt.datetime(2027, 3, 10, 9, 0), 900, "year-outside")
+
+        summary = usage_dashboard.query_summary("year", "2026")
+
+        self.assertEqual(summary["period"]["type"], "year")
+        self.assertEqual(summary["period"]["key"], "2026")
+        self.assertEqual(summary["summary"]["total_tokens"], 300)
+        self.assertEqual(len(summary["hours"]), 12)
+        self.assertEqual(summary["hours"][0]["bucket"], "2026-01")
+        self.assertEqual(summary["hours"][0]["total_tokens"], 0)
+        self.assertEqual(summary["hours"][2]["bucket"], "2026-03")
+        self.assertEqual(summary["hours"][2]["total_tokens"], 300)
+        self.assertEqual(summary["hours"][11]["bucket"], "2026-12")
+
+    def test_recent_requests_can_filter_by_day_period(self):
+        self.insert_usage(dt.datetime(2026, 5, 19, 8, 30), 100, "request-inside")
+        self.insert_usage(dt.datetime(2026, 5, 20, 8, 30), 900, "request-outside")
+
+        requests = usage_dashboard.recent_requests(100, "day", "2026-05-19")
+
+        self.assertEqual([row["request_id"] for row in requests], ["request-inside"])
+
+    def test_recent_requests_can_filter_by_month_period(self):
+        self.insert_usage(dt.datetime(2026, 5, 19, 8, 30), 100, "request-may")
+        self.insert_usage(dt.datetime(2026, 6, 1, 8, 30), 900, "request-june")
+
+        requests = usage_dashboard.recent_requests(100, "month", "2026-05")
+
+        self.assertEqual([row["request_id"] for row in requests], ["request-may"])
+
+    def test_recent_requests_can_filter_by_year_period(self):
+        self.insert_usage(dt.datetime(2026, 5, 19, 8, 30), 100, "request-2026")
+        self.insert_usage(dt.datetime(2027, 1, 1, 8, 30), 900, "request-2027")
+
+        requests = usage_dashboard.recent_requests(100, "year", "2026")
+
+        self.assertEqual([row["request_id"] for row in requests], ["request-2026"])
 
 
 class StartDashboardCmdTest(unittest.TestCase):

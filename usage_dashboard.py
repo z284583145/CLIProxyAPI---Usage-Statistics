@@ -432,6 +432,119 @@ def range_bounds(name):
     return start.astimezone(dt.timezone.utc).timestamp(), now.astimezone(dt.timezone.utc).timestamp()
 
 
+LEGACY_RANGES = {"today", "1h", "5h", "24h", "7d"}
+PERIOD_TYPES = {"day", "month", "year"}
+
+
+def epoch_bounds(start_local, end_local):
+    return (
+        start_local.astimezone(dt.timezone.utc).timestamp(),
+        end_local.astimezone(dt.timezone.utc).timestamp(),
+    )
+
+
+def month_bounds(year, month):
+    start = dt.datetime(year, month, 1, tzinfo=LOCAL_TZ)
+    if month == 12:
+        end = dt.datetime(year + 1, 1, 1, tzinfo=LOCAL_TZ)
+    else:
+        end = dt.datetime(year, month + 1, 1, tzinfo=LOCAL_TZ)
+    return start, end
+
+
+def normalize_summary_period(period_type=None, period_key=None):
+    requested_type = period_type if period_type in PERIOD_TYPES else "day"
+    now = dt.datetime.now(LOCAL_TZ)
+    try:
+        if requested_type == "day":
+            day = dt.date.fromisoformat(str(period_key or now.date().isoformat()))
+            start = dt.datetime(day.year, day.month, day.day, tzinfo=LOCAL_TZ)
+            end = start + dt.timedelta(days=1)
+            key = day.isoformat()
+            label = key
+        elif requested_type == "month":
+            raw_year, raw_month = str(period_key or now.strftime("%Y-%m")).split("-", 1)
+            year, month = int(raw_year), int(raw_month)
+            if month < 1 or month > 12:
+                raise ValueError("month must be 1-12")
+            start, end = month_bounds(year, month)
+            key = f"{year:04d}-{month:02d}"
+            label = key
+        else:
+            year = int(period_key or now.year)
+            start = dt.datetime(year, 1, 1, tzinfo=LOCAL_TZ)
+            end = dt.datetime(year + 1, 1, 1, tzinfo=LOCAL_TZ)
+            key = f"{year:04d}"
+            label = key
+    except (TypeError, ValueError):
+        today = now.date()
+        start = dt.datetime(today.year, today.month, today.day, tzinfo=LOCAL_TZ)
+        end = start + dt.timedelta(days=1)
+        requested_type = "day"
+        key = today.isoformat()
+        label = key
+
+    start_epoch, end_epoch = epoch_bounds(start, end)
+    return {
+        "type": requested_type,
+        "key": key,
+        "label": label,
+        "start": start,
+        "end": end,
+        "start_epoch": start_epoch,
+        "end_epoch": end_epoch,
+    }
+
+
+def period_bucket_template(period):
+    rows = []
+    start = period["start"]
+    end = period["end"]
+    if period["type"] == "day":
+        for hour in range(24):
+            bucket_time = start + dt.timedelta(hours=hour)
+            rows.append({"bucket": bucket_time.strftime("%Y-%m-%d %H:00"), "label": bucket_time.strftime("%H:00")})
+    elif period["type"] == "month":
+        days = (end.date() - start.date()).days
+        for offset in range(days):
+            bucket_date = start.date() + dt.timedelta(days=offset)
+            rows.append({"bucket": bucket_date.isoformat(), "label": f"{bucket_date.day}日"})
+    else:
+        for month in range(1, 13):
+            rows.append({"bucket": f"{start.year:04d}-{month:02d}", "label": f"{month}月"})
+    return rows
+
+
+def query_period_buckets(conn, period, start, end):
+    if period["type"] == "day":
+        bucket_expr = "local_hour"
+    elif period["type"] == "month":
+        bucket_expr = "local_date"
+    else:
+        bucket_expr = "substr(local_date, 1, 7)"
+
+    rows = conn.execute(
+        f"""
+        SELECT {bucket_expr} bucket,
+               COUNT(*) requests,
+               COALESCE(SUM(total_tokens),0) total_tokens,
+               COALESCE(SUM(failed),0) failed
+        FROM usage_events WHERE ts_epoch >= ? AND ts_epoch < ?
+        GROUP BY bucket ORDER BY bucket
+        """,
+        (start, end),
+    ).fetchall()
+    by_bucket = {row["bucket"]: dict(row) for row in rows}
+    result = []
+    for bucket in period_bucket_template(period):
+        values = by_bucket.get(
+            bucket["bucket"],
+            {"requests": 0, "total_tokens": 0, "failed": 0},
+        )
+        result.append({**bucket, **values, "hour": bucket["label"]})
+    return result
+
+
 def strip_yaml_scalar(value):
     text = value.strip()
     if (text.startswith('"') and text.endswith('"')) or (text.startswith("'") and text.endswith("'")):
@@ -522,12 +635,21 @@ def configured_api_label_by_hash(config_path):
     return {api_key_hash(key): mask_config_api_key(key) for key in configured_api_keys(config_path)}
 
 
-def query_summary(range_name):
-    start, end = range_bounds(range_name)
+def query_summary(period_type="today", period_key=None):
+    is_legacy_range = period_key is None and period_type in LEGACY_RANGES
+    if is_legacy_range:
+        start, end = range_bounds(period_type)
+        where_sql = "ts_epoch BETWEEN ? AND ?"
+        period_payload = {"type": "range", "key": period_type, "label": period_type}
+    else:
+        period = normalize_summary_period(period_type, period_key)
+        start, end = period["start_epoch"], period["end_epoch"]
+        where_sql = "ts_epoch >= ? AND ts_epoch < ?"
+        period_payload = {k: period[k] for k in ("type", "key", "label")}
     cfg = load_config()
     with db_connect() as conn:
         total = conn.execute(
-            """
+            f"""
             SELECT COUNT(*) requests,
                    COALESCE(SUM(total_tokens),0) total_tokens,
                    COALESCE(SUM(input_tokens),0) input_tokens,
@@ -535,12 +657,12 @@ def query_summary(range_name):
                    COALESCE(SUM(reasoning_tokens),0) reasoning_tokens,
                    COALESCE(SUM(cached_tokens),0) cached_tokens,
                    COALESCE(SUM(failed),0) failed
-            FROM usage_events WHERE ts_epoch BETWEEN ? AND ?
+            FROM usage_events WHERE {where_sql}
             """,
             (start, end),
         ).fetchone()
         accounts = conn.execute(
-            """
+            f"""
             SELECT COALESCE(source, auth_index, 'unknown') account,
                    COUNT(*) requests,
                    COALESCE(SUM(total_tokens),0) total_tokens,
@@ -548,35 +670,41 @@ def query_summary(range_name):
                    COALESCE(SUM(output_tokens),0) output_tokens,
                    COALESCE(SUM(reasoning_tokens),0) reasoning_tokens,
                    COALESCE(SUM(failed),0) failed
-            FROM usage_events WHERE ts_epoch BETWEEN ? AND ?
+            FROM usage_events WHERE {where_sql}
             GROUP BY account ORDER BY total_tokens DESC
             """,
             (start, end),
         ).fetchall()
         models = conn.execute(
-            """
+            f"""
             SELECT COALESCE(model, 'unknown') model,
                    COUNT(*) requests,
                    COALESCE(SUM(total_tokens),0) total_tokens,
                    COALESCE(SUM(failed),0) failed
-            FROM usage_events WHERE ts_epoch BETWEEN ? AND ?
+            FROM usage_events WHERE {where_sql}
             GROUP BY model ORDER BY total_tokens DESC LIMIT 12
             """,
             (start, end),
         ).fetchall()
-        hours = conn.execute(
-            """
-            SELECT local_hour hour,
-                   COUNT(*) requests,
-                   COALESCE(SUM(total_tokens),0) total_tokens,
-                   COALESCE(SUM(failed),0) failed
-            FROM usage_events WHERE ts_epoch BETWEEN ? AND ?
-            GROUP BY local_hour ORDER BY local_hour
-            """,
-            (start, end),
-        ).fetchall()
+        if is_legacy_range:
+            hours = conn.execute(
+                """
+                SELECT local_hour hour,
+                       local_hour bucket,
+                       substr(local_hour, 12, 5) label,
+                       COUNT(*) requests,
+                       COALESCE(SUM(total_tokens),0) total_tokens,
+                       COALESCE(SUM(failed),0) failed
+                FROM usage_events WHERE ts_epoch BETWEEN ? AND ?
+                GROUP BY local_hour ORDER BY local_hour
+                """,
+                (start, end),
+            ).fetchall()
+            hour_rows = [dict(x) for x in hours]
+        else:
+            hour_rows = query_period_buckets(conn, period, start, end)
         apis = conn.execute(
-            """
+            f"""
             SELECT COALESCE(NULLIF(api_key_hash, ''), 'unknown') api_key_hash,
                    COUNT(*) requests,
                    COALESCE(SUM(CASE WHEN failed = 0 THEN 1 ELSE 0 END),0) succeeded,
@@ -585,18 +713,19 @@ def query_summary(range_name):
                    COALESCE(SUM(input_tokens),0) input_tokens,
                    COALESCE(SUM(output_tokens),0) output_tokens,
                    COALESCE(SUM(reasoning_tokens),0) reasoning_tokens
-            FROM usage_events WHERE ts_epoch BETWEEN ? AND ?
+            FROM usage_events WHERE {where_sql}
             GROUP BY api_key_hash ORDER BY total_tokens DESC LIMIT 12
             """,
             (start, end),
         ).fetchall()
         api_stats = {row["api_key_hash"]: {k: row[k] for k in row.keys() if k != "api_key_hash"} for row in apis}
     return {
-        "range": range_name,
+        "range": period_type if is_legacy_range else period_payload["key"],
+        "period": period_payload,
         "summary": dict(total),
         "accounts": [dict(x) for x in accounts],
         "models": [dict(x) for x in models],
-        "hours": [dict(x) for x in hours],
+        "hours": hour_rows,
         "apis": configured_api_summaries(api_stats, cfg["cliproxy_config_path"]),
     }
 
@@ -616,18 +745,25 @@ def latest_quotas(force=False):
     return [dict(row) for row in rows]
 
 
-def recent_requests(limit=100):
+def recent_requests(limit=100, period_type=None, period_key=None):
     cfg = load_config()
     api_labels = configured_api_label_by_hash(cfg["cliproxy_config_path"])
+    params = []
+    where_sql = ""
+    if period_type in PERIOD_TYPES or period_key:
+        period = normalize_summary_period(period_type, period_key)
+        where_sql = "WHERE ts_epoch >= ? AND ts_epoch < ?"
+        params.extend([period["start_epoch"], period["end_epoch"]])
+    params.append(limit)
     with db_connect() as conn:
         rows = conn.execute(
-            """
+            f"""
             SELECT timestamp, source, auth_index, model, endpoint, failed, latency_ms,
                    input_tokens, output_tokens, reasoning_tokens, cached_tokens, total_tokens,
                    request_id, api_key_hash
-            FROM usage_events ORDER BY ts_epoch DESC LIMIT ?
+            FROM usage_events {where_sql} ORDER BY ts_epoch DESC LIMIT ?
             """,
-            (limit,),
+            params,
         ).fetchall()
     result = []
     for row in rows:
@@ -660,12 +796,24 @@ class DashboardHandler(BaseHTTPRequestHandler):
             if parsed.path == "/":
                 self.serve_html()
             elif parsed.path == "/api/summary":
-                json_response(self, query_summary(qs.get("range", ["today"])[0]))
+                if "period_type" in qs or "period_key" in qs:
+                    json_response(self, query_summary(qs.get("period_type", ["day"])[0], qs.get("period_key", [None])[0]))
+                else:
+                    json_response(self, query_summary(qs.get("range", ["today"])[0]))
             elif parsed.path == "/api/quota":
                 json_response(self, {"quotas": latest_quotas(force=qs.get("force", ["0"])[0] == "1")})
             elif parsed.path == "/api/requests":
                 limit = min(500, int(qs.get("limit", ["100"])[0]))
-                json_response(self, {"requests": recent_requests(limit)})
+                json_response(
+                    self,
+                    {
+                        "requests": recent_requests(
+                            limit,
+                            qs.get("period_type", [None])[0],
+                            qs.get("period_key", [None])[0],
+                        )
+                    },
+                )
             elif parsed.path == "/api/collector-status":
                 json_response(self, collector_status())
             elif parsed.path == "/api/health":
@@ -698,6 +846,8 @@ DASHBOARD_HTML = r"""<!doctype html>
     h1 { font-size:20px; margin:0; }
     main { padding:20px 24px 32px; max-width:1440px; margin:0 auto; }
     button, select { border:1px solid var(--line); background:#fff; color:var(--text); border-radius:6px; padding:8px 10px; font-size:14px; }
+    button, select, .date-cell { cursor:pointer; }
+    button:disabled, select:disabled { cursor:not-allowed; }
     button.primary { background:var(--blue); color:#fff; border-color:var(--blue); }
     .toolbar { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
     .collector-status { min-width:96px; color:var(--red); font-size:13px; font-weight:700; }
@@ -817,13 +967,6 @@ DASHBOARD_HTML = r"""<!doctype html>
           </div>
         </div>
       </div>
-      <select id="range">
-        <option value="today">今天</option>
-        <option value="1h">最近 1 小时</option>
-        <option value="5h">最近 5 小时</option>
-        <option value="24h">最近 24 小时</option>
-        <option value="7d">最近 7 天</option>
-      </select>
       <button id="refresh">刷新</button>
     </div>
   </header>
@@ -836,7 +979,7 @@ DASHBOARD_HTML = r"""<!doctype html>
       <div class="panel kpi"><div class="label">推理 Tokens</div><div class="value" id="kReason">0</div><div class="sub">reasoning</div></div>
     </section>
     <section class="grid two chart-stack">
-      <div class="panel hour-panel"><h2>按小时消耗</h2><canvas id="hourChart" width="900" height="260"></canvas></div>
+      <div class="panel hour-panel"><h2 id="periodChartTitle">按小时消耗</h2><canvas id="hourChart" width="900" height="260"></canvas></div>
       <div class="panel api-panel"><h2>API 详细统计<span class="heading-count" id="apiKeyCount">（0）</span></h2><div class="api-list" id="apiDetails"></div></div>
       <div class="panel model-panel"><h2>模型消耗</h2><canvas id="modelChart" width="520" height="260"></canvas></div>
     </section>
@@ -855,6 +998,36 @@ function compact(n){
   if (value >= 1000000) return (value / 1000000).toFixed(value >= 10000000 ? 0 : 1).replace(/\.0$/, '') + 'M';
   if (value >= 1000) return (value / 1000).toFixed(value >= 10000 ? 0 : 1).replace(/\.0$/, '') + 'K';
   return fmt(value);
+}
+function chartValueLabel(value){
+  const n = Number(value || 0);
+  if (n >= 100000000) return (n / 1000000).toFixed(0) + 'M';
+  if (n >= 1000000) return (n / 1000000).toFixed(1).replace(/\.0$/, '') + 'M';
+  if (n >= 10000) return (n / 1000).toFixed(0) + 'K';
+  if (n >= 1000) return (n / 1000).toFixed(1).replace(/\.0$/, '') + 'K';
+  return fmt(n);
+}
+function labelBoxOverlaps(box, boxes){
+  return boxes.some(item => box.x1 < item.x2 && box.x2 > item.x1 && box.y1 < item.y2 && box.y2 > item.y1);
+}
+function drawValueLabel(ctx, text, centerX, barTop, occupiedLabels){
+  const width = ctx.measureText(text).width;
+  const candidates = [
+    Math.max(14, barTop - 7),
+    Math.max(14, barTop - 23),
+    Math.max(14, barTop - 39),
+    Math.max(14, barTop + 13),
+  ];
+  let y = candidates[0];
+  for (const candidate of candidates) {
+    const box = {x1:centerX - width / 2 - 3, x2:centerX + width / 2 + 3, y1:candidate - 12, y2:candidate + 3};
+    if (!labelBoxOverlaps(box, occupiedLabels)) {
+      y = candidate;
+      occupiedLabels.push(box);
+      break;
+    }
+  }
+  ctx.fillText(text, centerX, y);
 }
 function esc(s){ return String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 async function getJSON(url){ const r = await fetch(url); if(!r.ok) throw new Error(await r.text()); return r.json(); }
@@ -905,6 +1078,8 @@ function pickDay(key){
   visibleDate = new Date(year, month - 1, 1);
   updateDateFilterTrigger();
   renderDateFilter();
+  closeDateFilter();
+  load();
 }
 function pickMonth(month){
   const year = visibleDate.getFullYear();
@@ -913,6 +1088,8 @@ function pickMonth(month){
   visibleDate = new Date(year, month, 1);
   updateDateFilterTrigger();
   renderDateFilter();
+  closeDateFilter();
+  load();
 }
 function pickYear(year){
   const key = yearKey(year);
@@ -920,6 +1097,8 @@ function pickYear(year){
   visibleDate = new Date(year, visibleDate.getMonth(), 1);
   updateDateFilterTrigger();
   renderDateFilter();
+  closeDateFilter();
+  load();
 }
 function renderDayGrid(grid){
   const year = visibleDate.getFullYear();
@@ -987,6 +1166,7 @@ function initDateFilter(){
     selectedPeriod = null;
     updateDateFilterTrigger();
     renderDateFilter();
+    load();
   };
   $('dateFilterGrid').onclick = event => {
     const target = event.target.closest('button');
@@ -1002,22 +1182,75 @@ function initDateFilter(){
   updateDateFilterTrigger();
   setCalendarView('day');
 }
+function activePeriod(){
+  return selectedPeriod || {type:'day', key:dateKey(today), label:dateKey(today)};
+}
+function summaryUrl(){
+  const period = activePeriod();
+  return `/api/summary?period_type=${encodeURIComponent(period.type)}&period_key=${encodeURIComponent(period.key)}`;
+}
+function requestsUrl(){
+  const period = activePeriod();
+  return `/api/requests?limit=120&period_type=${encodeURIComponent(period.type)}&period_key=${encodeURIComponent(period.key)}`;
+}
 function drawBars(canvas, rows, labelKey, valueKey, color){
   const ctx = canvas.getContext('2d'), w = canvas.width, h = canvas.height;
   ctx.clearRect(0,0,w,h); ctx.font = '12px -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif';
   const pad = {l:52,r:18,t:30,b:44}; const max = Math.max(1, ...rows.map(r => Number(r[valueKey] || 0)));
   const bw = Math.max(12, (w-pad.l-pad.r) / Math.max(1, rows.length) * .62);
+  const occupiedLabels = [];
   rows.forEach((r,i) => {
     const x = pad.l + i * ((w-pad.l-pad.r) / Math.max(1, rows.length)) + bw*.3;
     const bh = (h-pad.t-pad.b) * Number(r[valueKey] || 0) / max;
     const y = h-pad.b-bh;
     ctx.fillStyle = color; ctx.fillRect(x,y,bw,bh);
     ctx.fillStyle = '#667085'; ctx.textAlign = 'center';
-    const label = String(r[labelKey] || '').slice(-5);
+    const label = String(r[labelKey] || r.label || r.bucket || '').slice(-5);
     ctx.fillText(label, x+bw/2, h-18);
-    if (bh > 18) { ctx.fillStyle = '#17202a'; ctx.fillText(fmt(r[valueKey]), x+bw/2, Math.max(14, y-7)); }
+    if (Number(r[valueKey] || 0) > 0) { ctx.fillStyle = '#17202a'; drawValueLabel(ctx, chartValueLabel(r[valueKey]), x+bw/2, y, occupiedLabels); }
   });
   ctx.strokeStyle = '#d9dee7'; ctx.beginPath(); ctx.moveTo(pad.l,h-pad.b); ctx.lineTo(w-pad.r,h-pad.b); ctx.stroke();
+}
+function drawDayBars(canvas, rows){
+  const ctx = canvas.getContext('2d'), w = canvas.width, h = canvas.height;
+  ctx.clearRect(0,0,w,h); ctx.font = '12px -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif';
+  const pad = {l:44,r:26,t:30,b:44};
+  const max = Math.max(1, ...rows.map(r => Number(r.total_tokens || 0)));
+  const plotW = w - pad.l - pad.r;
+  const weakEnd = 8;
+  const weakW = plotW * .2;
+  const normalW = plotW - weakW;
+  const occupiedLabels = [];
+  const drawSegment = (segment, startX, width, muted) => {
+    if (!segment.length) return;
+    const step = width / segment.length;
+    const bw = Math.max(5, step * (muted ? .48 : .62));
+    segment.forEach((r, i) => {
+      const value = Number(r.total_tokens || 0);
+      const x = startX + i * step + (step - bw) / 2;
+      const bh = (h - pad.t - pad.b) * value / max;
+      const y = h - pad.b - bh;
+      ctx.fillStyle = muted ? 'rgba(37, 99, 235, .42)' : '#2563eb';
+      ctx.fillRect(x, y, bw, bh);
+      const hour = Number(String(r.label || r.hour || '').slice(0, 2));
+      const showLabel = !muted || hour % 2 === 0;
+      if (showLabel) {
+        ctx.fillStyle = muted ? '#98a2b3' : '#667085';
+        ctx.textAlign = 'center';
+        ctx.fillText(String(r.label || r.hour || '').slice(0, 5), x + bw / 2, h - 18);
+      }
+      if (value > 0) {
+        ctx.fillStyle = '#17202a';
+        ctx.textAlign = 'center';
+        drawValueLabel(ctx, chartValueLabel(value), x + bw / 2, y, occupiedLabels);
+      }
+    });
+  };
+  drawSegment(rows.slice(0, weakEnd), pad.l, weakW, true);
+  drawSegment(rows.slice(weakEnd), pad.l + weakW, normalW, false);
+  ctx.strokeStyle = '#d9dee7'; ctx.beginPath(); ctx.moveTo(pad.l,h-pad.b); ctx.lineTo(w-pad.r,h-pad.b); ctx.stroke();
+  ctx.strokeStyle = '#eef2f7';
+  ctx.beginPath(); ctx.moveTo(pad.l + weakW, pad.t); ctx.lineTo(pad.l + weakW, h - pad.b); ctx.stroke();
 }
 function drawHorizontal(canvas, rows){
   const ctx = canvas.getContext('2d'), w = canvas.width, h = canvas.height;
@@ -1076,11 +1309,10 @@ async function refreshQuota(){
   }
 }
 async function load(){
-  const range = $('range').value;
   const [summary, quota, reqs, collector] = await Promise.all([
-    getJSON('/api/summary?range=' + encodeURIComponent(range)),
+    getJSON(summaryUrl()),
     getJSON('/api/quota'),
-    getJSON('/api/requests?limit=120'),
+    getJSON(requestsUrl()),
     getJSON('/api/collector-status')
   ]);
   const s = summary.summary;
@@ -1093,13 +1325,18 @@ async function load(){
   renderQuotas(quota.quotas);
   $('requests').innerHTML = reqs.requests.map(r => `<tr><td>${esc(r.local_time)}</td><td>${esc(r.source || r.auth_index)}</td><td>${esc(r.api_label)}</td><td>${esc(r.model)}</td><td class="num">${fmt(r.total_tokens)}</td><td class="num">${fmt(r.input_tokens)}</td><td class="num">${fmt(r.output_tokens)}</td><td class="num">${fmt(r.reasoning_tokens)}</td><td class="num">${fmt(r.latency_ms)}ms</td><td><span class="request-status ${r.failed ? 'failed' : 'success'}">${r.failed ? '失败' : '成功'}</span></td></tr>`).join('');
   renderApis(summary.apis);
-  drawBars($('hourChart'), summary.hours, 'hour', 'total_tokens', '#2563eb');
+  const chartTitles = {day:'按小时消耗', month:'按日消耗', year:'按月消耗'};
+  $('periodChartTitle').textContent = chartTitles[summary.period?.type] || '按周期消耗';
+  if (summary.period?.type === 'day') {
+    drawDayBars($('hourChart'), summary.hours);
+  } else {
+    drawBars($('hourChart'), summary.hours, 'label', 'total_tokens', '#2563eb');
+  }
   drawHorizontal($('modelChart'), summary.models);
   renderCollectorStatus(collector);
 }
 $('refresh').onclick = () => load();
 $('quotaRefresh').onclick = () => refreshQuota();
-$('range').onchange = () => load();
 initDateFilter();
 load(); setInterval(() => load(), 30000);
 </script>

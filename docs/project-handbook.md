@@ -1,6 +1,6 @@
 # CLIProxyAPI 用量统计面板项目维护文档
 
-最后更新：2026-05-19
+最后更新：2026-05-20
 
 本文档用于记录当前项目实现现状、模块边界、数据与接口契约，以及后续需求变更时必须同步检查的内容。以后修改功能、页面、字段、配置、部署方式时，请同步更新本文档。
 
@@ -24,7 +24,7 @@ cliproxyapi-usage-dashboard/
   README.md
   usage_dashboard.py
   config.json
-  run_collector.cmd
+  start_dashboard.cmd
   .gitignore
   docs/
     dashboard-preview.svg
@@ -39,7 +39,7 @@ cliproxyapi-usage-dashboard/
 - `README.md`：面向使用者的安装、运行和安全说明。
 - `usage_dashboard.py`：项目主程序，包含采集、存储、接口和前端页面。
 - `config.json`：脱敏配置模板，可复制到运行目录后填入本机密钥。
-- `run_collector.cmd`：Windows 下启动采集器并写入本地日志的辅助脚本。
+- `start_dashboard.cmd`：Windows 下启动采集器和网页面板的统一脚本。
 - `docs/dashboard-preview.svg`：脱敏预览图。
 - `docs/project-handbook.md`：面向维护和需求变更的项目文档。
 - `launchd/*.plist`：macOS 后台运行模板。
@@ -108,7 +108,7 @@ http://127.0.0.1:8320/
 | `cliproxy_port` | `8317` | CLIProxyAPI Management API 的 RESP 端口。 |
 | `management_key` | 空字符串 | CLIProxyAPI Management API 明文密钥。 |
 | `poll_interval_seconds` | `2` | 采集器轮询用量队列的间隔。 |
-| `quota_refresh_seconds` | `7200` | 账号余量刷新间隔。 |
+| `quota_refresh_seconds` | `14400` | 账号余量刷新间隔，默认 4 小时。 |
 | `dashboard_host` | `127.0.0.1` | 网页面板监听地址。 |
 | `dashboard_port` | `8320` | 网页面板监听端口。 |
 | `cliproxy_config_path` | 上级目录 `config.yaml` | 用于读取 CLIProxyAPI `api-keys` 并在页面上展示脱敏 API 标识。 |
@@ -123,7 +123,7 @@ http://127.0.0.1:8320/
 维护注意：
 
 - 新增配置项时，需要同步更新 `DEFAULT_CONFIG`、README、本文档和任何示例配置。
-- 如果配置项影响部署脚本，还要同步检查 `run_collector.cmd` 和 `launchd/*.plist`。
+- 如果配置项影响部署脚本，还要同步检查 `start_dashboard.cmd` 和 `launchd/*.plist`。
 - `management_key`、OAuth token、API key 不能写入文档、截图、提交记录或示例真实值。
 
 ## 5. 数据流
@@ -151,9 +151,11 @@ flowchart LR
 展示链路：
 
 1. 浏览器访问 `/` 获取内置 HTML。
-2. 页面 JavaScript 同时请求 `/api/summary`、`/api/quota`、`/api/requests`。
-3. 页面每 30 秒自动刷新一次数据。
-4. 用户点击“刷新余量”时，会请求 `/api/quota?force=1`。
+2. 页面 JavaScript 根据日期选择器请求 `/api/summary?period_type=...&period_key=...`。
+3. 页面 JavaScript 同时请求 `/api/quota`、`/api/requests?period_type=...&period_key=...` 和 `/api/collector-status`。
+4. 页面每 30 秒执行一次普通 `load()` 刷新。
+5. 顶部“刷新”按钮也执行普通 `load()`。
+6. 用户点击账号余量面板里的刷新按钮时，会请求 `/api/quota?force=1`。
 
 ## 6. 数据库表
 
@@ -234,26 +236,26 @@ SQLite 使用 WAL 模式，并设置了 `busy_timeout=5000`。
 | 接口 | 参数 | 返回内容 |
 | --- | --- | --- |
 | `GET /api/health` | 无 | 服务状态、数据库路径、凭证文件数量。 |
-| `GET /api/summary?range=today` | `range` | 汇总指标、账号统计、模型统计、小时统计、API key 统计。 |
+| `GET /api/summary?period_type=day&period_key=2026-05-19` | `period_type`、`period_key` | 汇总指标、账号统计、模型统计、周期柱状图桶、API key 统计。 |
 | `GET /api/quota` | 无 | 每个账号最新余量快照。 |
 | `GET /api/quota?force=1` | `force=1` | 强制刷新后返回账号余量。 |
-| `GET /api/requests?limit=100` | `limit` | 最近请求明细，最多 500 条。 |
+| `GET /api/requests?limit=100&period_type=day&period_key=2026-05-19` | `limit`、`period_type`、`period_key` | 指定周期内的最近请求明细，最多 500 条。 |
 
-`range` 可选值：
+`period_type` 可选值：
 
 ```text
-today
-1h
-5h
-24h
-7d
+day    period_key=YYYY-MM-DD
+month  period_key=YYYY-MM
+year   period_key=YYYY
 ```
+
+兼容说明：`/api/summary?range=today|1h|5h|24h|7d` 仍然保留给命令行报表和旧调用。网页面板使用 `period_type` / `period_key`。
 
 维护注意：
 
 - 新增或改名接口时，必须同步更新页面 JavaScript、README、本文档。
 - 新增统计字段时，必须同步检查 SQL 查询、JSON 返回、页面渲染、命令行 `report` 输出。
-- `range_bounds()` 当前固定使用 Asia/Shanghai 本地时区，涉及跨时区需求时要先确认统计口径。
+- `normalize_summary_period()` 和 `range_bounds()` 当前固定使用 Asia/Shanghai 本地时区，涉及跨时区需求时要先确认统计口径。
 
 ## 8. 页面结构
 
@@ -263,20 +265,24 @@ today
 
 | 区块 | 数据来源 | 说明 |
 | --- | --- | --- |
-| 顶部工具栏 | 本地状态 | 时间范围选择、刷新、刷新余量、更新时间。 |
-| KPI 卡片 | `/api/summary` | 请求数、失败数、总 token、输入、输出、推理。 |
-| 按小时消耗 | `/api/summary.hours` | 原生 Canvas 绘制柱状图。 |
+| 顶部工具栏 | 本地状态 | 采集状态、日期选择器、普通刷新按钮。 |
+| KPI 卡片 | `/api/summary` | 跟随日期选择器展示请求数、失败数、总 token、输入、输出、推理。 |
+| 周期消耗柱状图 | `/api/summary.hours` | 原生 Canvas 绘制；日=24 小时、月=自然日、年=12 个月。 |
 | API 详细统计 | `/api/summary.apis` | 按客户端 API key 脱敏统计请求和 token。 |
 | 模型消耗 | `/api/summary.models` | 原生 Canvas 绘制横向条形图。 |
 | 账号消耗 | `/api/summary.accounts` | 按账号汇总请求和 token。 |
 | 账号余量 | `/api/quota` | 5 小时、7 天剩余百分比和重置时间。 |
-| 最近每次请求/任务 | `/api/requests` | 最近请求明细。 |
+| 最近每次请求/任务 | `/api/requests` | 指定日期周期内的最近请求明细，跟随日期选择器。 |
 
 前端实现特点：
 
-- 下拉选择器是原生 `<select id="range">`。
+- 日期选择器是无构建的原生 HTML/CSS/JavaScript 组件，状态保存在 `selectedPeriod`。
+- `summaryUrl()` 把 `selectedPeriod` 转成 `/api/summary?period_type=...&period_key=...`。
+- `requestsUrl()` 把 `selectedPeriod` 转成 `/api/requests?limit=120&period_type=...&period_key=...`。
 - 图表是原生 `<canvas>` 绘制。
-- 页面每 30 秒执行一次 `load(false)` 自动刷新。
+- 页面每 30 秒执行一次 `load()` 自动刷新。
+- 日视图柱状图由 `drawDayBars()` 绘制，会压缩左侧 `00:00` 到 `07:00` 的弱化区间，让 `08:00` 到 `24:00` 前的正常显示区占据主要宽度。
+- 柱状图数值标签由 `chartValueLabel()` 和 `drawValueLabel()` 绘制：画布上使用 `K` / `M` 紧凑格式，并通过标签碰撞检测避免相邻大数字重叠。
 - 所有动态插入文本均通过 `esc()` 做 HTML 转义。
 
 维护注意：
@@ -311,6 +317,14 @@ Authorization: Bearer <access_token>
 Accept: application/json
 User-Agent: codex-cli
 ```
+
+刷新路径：
+
+- 采集器在 `collect_forever()` 中按 `quota_refresh_seconds` 周期调用 `refresh_quota(force=True)`。
+- 页面普通 `load()` 会请求 `/api/quota`，后端先执行 `refresh_quota(force=False)`。
+- `force=False` 时，如果最新快照未超过 `quota_refresh_seconds`，只返回本地数据库快照。
+- 如果没有快照或快照已过期，普通 `/api/quota` 会触发真实余量刷新。
+- 账号余量面板内的刷新按钮请求 `/api/quota?force=1`，强制刷新真实余量。
 
 维护注意：
 
@@ -350,25 +364,18 @@ hash******xxxx
 
 ### 11.1 Windows
 
-当前仓库包含 `run_collector.cmd`，用于在 Windows 下启动采集器：
+当前仓库包含 `start_dashboard.cmd`，用于在 Windows 下启动统一服务：
 
 ```text
-run_collector.cmd
+start_dashboard.cmd
 ```
 
 脚本会：
 
 - 切到脚本所在目录。
-- 确保 `logs` 目录存在。
-- 使用本机 Codex runtime Python 运行 `usage_dashboard.py collect`。
-- 将标准输出写入 `logs/collector.out.log`。
-- 将错误输出写入 `logs/collector.err.log`。
-
-如需后台运行 `serve`，需要另行启动：
-
-```text
-python usage_dashboard.py serve
-```
+- 使用本机 Codex runtime Python 运行 `usage_dashboard.py run`。
+- 在同一进程中启动采集器线程和网页面板。
+- 在终端中按 `Ctrl+C` 停止服务，随后显示 `Services stopped.`。
 
 ### 11.2 macOS
 
@@ -406,15 +413,16 @@ usage_dashboard.py serve
 - `report` 命令输出说明。
 - README 和本文档。
 
-### 12.2 新增时间范围
+### 12.2 新增统计周期或时间范围
 
 需要同步：
 
-- `range_bounds()`。
+- `normalize_summary_period()`、`period_bucket_template()` 和 `query_period_buckets()`。
+- 如需保留命令行兼容窗口，再同步 `range_bounds()`。
 - 命令行 `report_p.add_argument(... choices=[...])`。
-- 页面 `<select id="range">` 的 `<option>`。
+- 页面日期选择器的日/月/年状态和 `summaryUrl()`。
 - README 的 API 和命令说明。
-- 本文档的 `range` 可选值。
+- 本文档的 `period_type` / `period_key` 可选值。
 
 ### 12.3 修改页面展示
 
@@ -434,7 +442,7 @@ usage_dashboard.py serve
 - `DEFAULT_CONFIG`。
 - `load_config()`。
 - README 安装与配置说明。
-- `run_collector.cmd`。
+- `start_dashboard.cmd`。
 - `launchd/*.plist`。
 - 本文档“配置项”和“部署与运行”。
 
@@ -474,22 +482,20 @@ python usage_dashboard.py serve
 浏览器验证：
 
 - 打开 `http://127.0.0.1:8320/`。
-- 切换所有时间范围。
+- 切换日期选择器的日、月、年。
 - 点击“刷新”。
-- 点击“刷新余量”。
-- 检查 KPI、小时图、API 统计、模型图、账号表、余量表、最近请求表是否正常渲染。
+- 点击账号余量面板里的刷新按钮。
+- 检查 KPI、周期柱状图、API 统计、模型图、账号表、余量表、最近请求表是否正常渲染。
 
 接口验证：
 
 ```text
 GET /api/health
-GET /api/summary?range=today
-GET /api/summary?range=1h
-GET /api/summary?range=5h
-GET /api/summary?range=24h
-GET /api/summary?range=7d
+GET /api/summary?period_type=day&period_key=2026-05-19
+GET /api/summary?period_type=month&period_key=2026-05
+GET /api/summary?period_type=year&period_key=2026
 GET /api/quota
-GET /api/requests?limit=100
+GET /api/requests?limit=100&period_type=day&period_key=2026-05-19
 ```
 
 安全验证：
