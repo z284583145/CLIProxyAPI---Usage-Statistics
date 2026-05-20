@@ -166,24 +166,57 @@ export CLIPROXY_MANAGEMENT_KEY="your-management-key"
 python3 ~/.cli-proxy-api/usage-dashboard/usage_dashboard.py init
 ```
 
-## 手动运行
+## 启动
 
-打开第一个终端，启动采集器：
+### Windows 一键启动（推荐）
 
-```bash
-python3 ~/.cli-proxy-api/usage-dashboard/usage_dashboard.py collect
+先确认 CLIProxyAPI 已经启动，并且 Management API 监听在配置里的地址，默认是：
+
+```text
+127.0.0.1:8317
 ```
 
-打开第二个终端，启动网页服务：
+然后在项目目录双击：
 
-```bash
-python3 ~/.cli-proxy-api/usage-dashboard/usage_dashboard.py serve
+```text
+start_dashboard.cmd
 ```
+
+这个脚本会在同一个终端里启动采集器和网页面板：
+
+- 采集器：持续从 CLIProxyAPI 用量队列采集数据
+- 网页面板：监听 `http://127.0.0.1:8320`
 
 浏览器访问：
 
 ```text
 http://127.0.0.1:8320
+```
+
+退出时，在启动窗口里按 `Ctrl+C`，采集器和网页面板会一起停止。看到 `Services stopped.` 后，可以关闭窗口。
+
+### 命令行统一启动
+
+如果不用 `start_dashboard.cmd`，也可以直接运行统一命令：
+
+```bash
+python3 ~/.cli-proxy-api/usage-dashboard/usage_dashboard.py run
+```
+
+`run` 会在同一个进程中启动采集器和网页面板，按 `Ctrl+C` 停止。
+
+### 分开运行（调试用）
+
+需要单独调试采集器时，打开第一个终端：
+
+```bash
+python3 ~/.cli-proxy-api/usage-dashboard/usage_dashboard.py collect
+```
+
+需要单独调试网页服务时，打开第二个终端：
+
+```bash
+python3 ~/.cli-proxy-api/usage-dashboard/usage_dashboard.py serve
 ```
 
 ## macOS 后台运行

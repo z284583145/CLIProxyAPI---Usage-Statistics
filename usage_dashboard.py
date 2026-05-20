@@ -8,6 +8,7 @@ import os
 import socket
 import sqlite3
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -1025,7 +1026,29 @@ def serve():
     cfg = load_config()
     server = ThreadingHTTPServer((cfg["dashboard_host"], int(cfg["dashboard_port"])), DashboardHandler)
     print(f"dashboard listening on http://{cfg['dashboard_host']}:{cfg['dashboard_port']}", flush=True)
-    server.serve_forever()
+    try:
+        server.serve_forever()
+    finally:
+        server.server_close()
+
+
+def run():
+    init_db()
+    cfg = load_config()
+    collector = threading.Thread(target=collect_forever, name="usage-dashboard-collector", daemon=True)
+    collector.start()
+
+    server = ThreadingHTTPServer((cfg["dashboard_host"], int(cfg["dashboard_port"])), DashboardHandler)
+    print("collector started", flush=True)
+    print(f"dashboard listening on http://{cfg['dashboard_host']}:{cfg['dashboard_port']}", flush=True)
+    print("press Ctrl+C to stop collector and dashboard", flush=True)
+
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nstopping collector and dashboard", flush=True)
+    finally:
+        server.server_close()
 
 
 def print_report(range_name):
@@ -1040,6 +1063,7 @@ def main():
     sub.add_parser("init")
     sub.add_parser("collect")
     sub.add_parser("serve")
+    sub.add_parser("run")
     quota_p = sub.add_parser("quota")
     quota_p.add_argument("--force", action="store_true")
     report_p = sub.add_parser("report")
@@ -1053,6 +1077,8 @@ def main():
         collect_forever()
     elif args.cmd == "serve":
         serve()
+    elif args.cmd == "run":
+        run()
     elif args.cmd == "quota":
         init_db()
         print(json.dumps({"quotas": latest_quotas(force=args.force)}, ensure_ascii=False, indent=2))

@@ -1,7 +1,11 @@
+from pathlib import Path
 import re
 import unittest
 
 import usage_dashboard
+
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
 class DashboardHtmlTest(unittest.TestCase):
@@ -100,6 +104,22 @@ class DashboardHtmlTest(unittest.TestCase):
         )
         self.assertIsNotNone(summary_url_match)
         self.assertNotRegex(self.html, r"/api/summary\?[^']*date")
+
+
+class StartDashboardCmdTest(unittest.TestCase):
+    def test_start_dashboard_runs_single_python_supervisor_command(self):
+        content = (ROOT / "start_dashboard.cmd").read_text(encoding="utf-8")
+
+        self.assertIn("usage_dashboard.py run", content)
+        self.assertNotIn("usage_dashboard.py collect", content)
+        self.assertNotIn("usage_dashboard.py serve", content)
+        self.assertNotIn("Start-Process", content)
+        self.assertNotIn("-WindowStyle Hidden", content)
+        self.assertNotIn("dashboard.pids", content)
+        self.assertNotIn('if /I "%~1"=="stop"', content)
+
+    def test_dashboard_has_run_command_for_single_process_supervision(self):
+        self.assertTrue(hasattr(usage_dashboard, "run"))
 
 
 if __name__ == "__main__":
