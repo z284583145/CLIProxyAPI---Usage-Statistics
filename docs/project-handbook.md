@@ -22,12 +22,14 @@
 ```text
 cliproxyapi-usage-dashboard/
   README.md
+  CHANGELOG.md
   usage_dashboard.py
   config.json
   start_dashboard.cmd
   .gitignore
   docs/
     dashboard-preview.svg
+    deployment.md
     project-handbook.md
   launchd/
     com.cliproxyapi.usage-collector.plist
@@ -37,10 +39,12 @@ cliproxyapi-usage-dashboard/
 说明：
 
 - `README.md`：面向使用者的安装、运行和安全说明。
+- `CHANGELOG.md`：发布变更记录。
 - `usage_dashboard.py`：项目主程序，包含采集、存储、接口和前端页面。
 - `config.json`：脱敏配置模板，可复制到运行目录后填入本机密钥。
 - `start_dashboard.cmd`：Windows 下启动采集器和网页面板的统一脚本。
 - `docs/dashboard-preview.svg`：脱敏预览图。
+- `docs/deployment.md`：生产部署、发布验证和回滚方案。
 - `docs/project-handbook.md`：面向维护和需求变更的项目文档。
 - `launchd/*.plist`：macOS 后台运行模板。
 
@@ -62,6 +66,7 @@ cliproxyapi-usage-dashboard/
 python usage_dashboard.py init
 python usage_dashboard.py collect
 python usage_dashboard.py serve
+python usage_dashboard.py run
 python usage_dashboard.py quota --force
 python usage_dashboard.py report today
 python usage_dashboard.py report 1h
@@ -77,6 +82,7 @@ python usage_dashboard.py report 7d
 | `init` | 初始化运行目录、配置文件和 SQLite 表结构。 |
 | `collect` | 长驻采集 CLIProxyAPI 用量队列，并按周期刷新账号余量。 |
 | `serve` | 启动本地网页服务和 JSON API。 |
+| `run` | 在同一进程中启动采集 watchdog 和网页服务，适合 Windows 一键启动。 |
 | `quota --force` | 手动强制刷新账号余量。 |
 | `report <range>` | 输出指定时间窗口的 JSON 汇总报表。 |
 
@@ -194,7 +200,7 @@ SQLite 使用 WAL 模式，并设置了 `busy_timeout=5000`。
 | `reasoning_tokens` | 推理 token。 |
 | `cached_tokens` | 缓存 token。 |
 | `total_tokens` | 总 token。 |
-| `raw_json` | 原始事件 JSON。 |
+| `raw_json` | 脱敏后的事件 JSON，`api_key`、`authorization`、`access_token`、`refresh_token`、`id_token` 会替换为 `[redacted]`。 |
 
 相关索引：
 
@@ -237,8 +243,8 @@ SQLite 使用 WAL 模式，并设置了 `busy_timeout=5000`。
 | --- | --- | --- |
 | `GET /api/health` | 无 | 服务状态、数据库路径、凭证文件数量。 |
 | `GET /api/summary?period_type=day&period_key=2026-05-19` | `period_type`、`period_key` | 汇总指标、账号统计、模型统计、周期柱状图桶、API key 统计。 |
-| `GET /api/quota` | 无 | 每个账号最新余量快照。 |
-| `GET /api/quota?force=1` | `force=1` | 强制刷新后返回账号余量。 |
+| `GET /api/quota` | 无 | 每个账号最新余量快照，不返回 `raw_json`。 |
+| `GET /api/quota?force=1` | `force=1` | 强制刷新后返回账号余量，不返回 `raw_json`。 |
 | `GET /api/requests?limit=100&period_type=day&period_key=2026-05-19` | `limit`、`period_type`、`period_key` | 指定周期内的最近请求明细，最多 500 条。 |
 
 `period_type` 可选值：
@@ -373,7 +379,7 @@ start_dashboard.cmd
 脚本会：
 
 - 切到脚本所在目录。
-- 使用本机 Codex runtime Python 运行 `usage_dashboard.py run`。
+- 优先使用本机 Codex runtime Python 运行 `usage_dashboard.py run`，如果该路径不存在则回退到 PATH 中的 `python`。
 - 在同一进程中启动采集器线程和网页面板。
 - 在终端中按 `Ctrl+C` 停止服务，随后显示 `Services stopped.`。
 
@@ -502,6 +508,13 @@ GET /api/requests?limit=100&period_type=day&period_key=2026-05-19
 
 ```text
 git grep -n -I "refresh_token\|id_token\|gho_\|Bearer [A-Za-z0-9]\|chatgpt_account_id"
+```
+
+构建与测试：
+
+```text
+python -m unittest discover -s tests -p "test_*.py" -v
+python -m compileall usage_dashboard.py tests
 ```
 
 提交前确认：

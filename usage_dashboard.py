@@ -254,6 +254,27 @@ def event_key(payload, raw):
     return hashlib.sha256(raw.encode()).hexdigest()
 
 
+SENSITIVE_RAW_FIELDS = {"api_key", "authorization", "access_token", "refresh_token", "id_token"}
+
+
+def redact_sensitive_fields(value):
+    if isinstance(value, dict):
+        redacted = {}
+        for key, item in value.items():
+            if key.lower() in SENSITIVE_RAW_FIELDS and item:
+                redacted[key] = "[redacted]"
+            else:
+                redacted[key] = redact_sensitive_fields(item)
+        return redacted
+    if isinstance(value, list):
+        return [redact_sensitive_fields(item) for item in value]
+    return value
+
+
+def safe_usage_raw_json(payload):
+    return json.dumps(redact_sensitive_fields(payload), ensure_ascii=False)
+
+
 def insert_usage(raw_items):
     inserted = 0
     with db_connect() as conn:
@@ -288,7 +309,7 @@ def insert_usage(raw_items):
                 "reasoning_tokens": int(tokens.get("reasoning_tokens") or 0),
                 "cached_tokens": int(tokens.get("cached_tokens") or 0),
                 "total_tokens": int(tokens.get("total_tokens") or 0),
-                "raw_json": raw,
+                "raw_json": safe_usage_raw_json(payload),
             }
             try:
                 conn.execute(
@@ -415,6 +436,41 @@ def collect_forever():
             mark_collector_error(exc)
             print(f"collector error: {exc}", file=sys.stderr, flush=True)
             time.sleep(5)
+
+
+def start_collector_watchdog(restart_delay_seconds=5, target=collect_forever, stop_event=None):
+    stop_event = stop_event or threading.Event()
+
+    def supervise():
+        while not stop_event.is_set():
+            errors = []
+
+            def run_target():
+                try:
+                    target()
+                except BaseException as exc:
+                    errors.append(exc)
+
+            worker = threading.Thread(target=run_target, name="usage-dashboard-collector", daemon=True)
+            worker.start()
+            while worker.is_alive() and not stop_event.is_set():
+                worker.join(1)
+
+            if stop_event.is_set():
+                break
+            if errors:
+                mark_collector_error(errors[0])
+                print(f"collector crashed: {errors[0]}", file=sys.stderr, flush=True)
+            else:
+                err = RuntimeError("collector exited unexpectedly; restarting")
+                mark_collector_error(err)
+                print(str(err), file=sys.stderr, flush=True)
+            if restart_delay_seconds:
+                stop_event.wait(restart_delay_seconds)
+
+    watchdog = threading.Thread(target=supervise, name="usage-dashboard-collector-watchdog", daemon=True)
+    watchdog.start()
+    return stop_event, watchdog
 
 
 def range_bounds(name):
@@ -742,7 +798,7 @@ def latest_quotas(force=False):
             ORDER BY email
             """
         ).fetchall()
-    return [dict(row) for row in rows]
+    return [{key: row[key] for key in row.keys() if key != "raw_json"} for row in rows]
 
 
 def recent_requests(limit=100, period_type=None, period_key=None):
@@ -839,64 +895,80 @@ DASHBOARD_HTML = r"""<!doctype html>
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>CLIProxyAPI 用量统计</title>
   <style>
-    :root { color-scheme: light; --bg:#f6f7f9; --panel:#fff; --text:#17202a; --muted:#667085; --line:#d9dee7; --blue:#2563eb; --green:#0f9f6e; --red:#d92d20; --amber:#b7791f; }
+    :root { color-scheme: light; --bg:#faf9f5; --panel:#f0eee8; --surface:#fffdf9; --layer-1:var(--bg); --layer-2:var(--panel); --layer-3:var(--surface); --surface-soft:#f6f4ee; --hover:#e9e6df; --row-hover:rgba(139, 134, 128, .08); --text:#2d2a26; --muted:#6d6760; --muted-soft:#a29c95; --line:#e3e1db; --line-strong:#d5d2cb; --primary:#8b8680; --primary-hover:#7f7a74; --primary-active:#726d67; --blue:var(--primary); --green:#10b981; --green-bg:#d1fae5; --green-text:#065f46; --green-border:#6ee7b7; --red:#c65746; --red-bg:#c6574624; --red-text:#8a3a30; --red-border:#c6574659; --amber:#e0aa14; --amber-bg:#e0aa1424; --amber-text:#8a6408; --amber-border:#e0aa1459; --shadow:0 1px 2px 0 #00000014; --shadow-lg:0 10px 18px -3px #0000001a; }
     * { box-sizing: border-box; }
-    body { margin:0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background:var(--bg); color:var(--text); }
-    header { display:flex; align-items:center; justify-content:space-between; gap:16px; padding:18px 24px; border-bottom:1px solid var(--line); background:#fff; position:sticky; top:0; z-index:2; }
-    h1 { font-size:20px; margin:0; }
+    body { margin:0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background:linear-gradient(180deg, var(--bg), var(--surface-soft)); color:var(--text); min-height:100vh; }
+    header { display:flex; align-items:center; justify-content:space-between; gap:16px; padding:18px 24px; border-bottom:1px solid var(--line); background:var(--surface); position:sticky; top:0; z-index:2; box-shadow:var(--shadow); }
+    h1 { font-family:"Arial Black", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; font-size:22px; line-height:1; margin:0; font-weight:900; letter-spacing:0; color:var(--text); }
     main { padding:20px 24px 32px; max-width:1440px; margin:0 auto; }
-    button, select { border:1px solid var(--line); background:#fff; color:var(--text); border-radius:6px; padding:8px 10px; font-size:14px; }
+    button, select { border:1px solid var(--line); background:var(--panel); color:var(--text); border-radius:8px; padding:8px 10px; font-size:14px; font-weight:600; transition:background .15s, border-color .15s, color .15s, box-shadow .15s; }
     button, select, .date-cell { cursor:pointer; }
     button:disabled, select:disabled { cursor:not-allowed; }
-    button.primary { background:var(--blue); color:#fff; border-color:var(--blue); }
+    button:hover:not(:disabled), select:hover:not(:disabled) { background:var(--hover); border-color:var(--line-strong); }
+    button:focus-visible, select:focus-visible { outline:none; border-color:var(--primary); box-shadow:0 0 0 3px rgba(139, 134, 128, .22); }
+    button.primary { background:var(--primary); color:#fff; border-color:var(--primary); }
+    button.primary:hover:not(:disabled) { background:var(--primary-hover); border-color:var(--primary-hover); }
     .toolbar { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
-    .collector-status { min-width:96px; color:var(--red); font-size:13px; font-weight:700; }
-    .collector-status.ok { color:var(--green); }
+    .collector-status { min-width:96px; display:inline-flex; align-items:center; justify-content:center; color:var(--red-text); background:var(--red-bg); border:1px solid var(--red-border); border-radius:9999px; padding:5px 10px; font-size:13px; font-weight:700; }
+    .collector-status.ok { color:var(--green-text); background:var(--green-bg); border-color:var(--green-border); }
+    .toast-stack { position:fixed; top:0; left:50%; width:min(420px, calc(100vw - 32px)); display:grid; gap:10px; padding-top:16px; transform:translateX(-50%); z-index:20; pointer-events:none; }
+    .toast { display:flex; align-items:center; gap:10px; min-height:48px; padding:12px 16px; border:1px solid var(--line); border-radius:4px; background:var(--surface); box-shadow:var(--shadow-lg); color:var(--text); font-size:14px; font-weight:500; animation:toast-in .24s ease-out both; }
+    .toast.success { color:var(--green-text); background:var(--green-bg); border-color:var(--green-border); }
+    .toast.error { color:var(--red-text); background:#fff1f0; border-color:#ffd6d3; }
+    .toast.warning { color:var(--amber-text); background:#fff7e6; border-color:#ffe2a8; }
+    .toast.removing { animation:toast-out .2s ease-in both; }
+    .toast-icon { width:16px; height:16px; display:inline-flex; align-items:center; justify-content:center; border-radius:50%; color:#fff; font-size:11px; line-height:1; font-weight:900; }
+    .toast.success .toast-icon { background:var(--green); }
+    .toast.error .toast-icon { background:var(--red); }
+    .toast.warning .toast-icon { background:var(--amber); }
+    @keyframes toast-in { from { opacity:0; transform:translateY(-24px); } to { opacity:1; transform:translateY(0); } }
+    @keyframes toast-out { from { opacity:1; transform:translateY(0); } to { opacity:0; transform:translateY(-24px); } }
     .date-filter { position:relative; }
     .date-filter-control { position:relative; }
-    .date-filter-trigger { height:38px; min-width:218px; display:flex; align-items:center; justify-content:flex-start; gap:8px; padding:8px 32px 8px 12px; background:#fff; border-radius:4px; }
-    .date-filter-trigger[aria-expanded="true"] { border-color:#2684ff; box-shadow:0 0 0 2px rgba(38, 132, 255, .12); }
-    .date-filter-icon { flex:none; width:14px; height:14px; color:#b8c2d2; }
-    .date-filter-value { max-width:154px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-weight:400; color:#344054; }
+    .date-filter-trigger { height:38px; min-width:218px; display:flex; align-items:center; justify-content:flex-start; gap:8px; padding:8px 32px 8px 12px; background:var(--surface); border-radius:8px; }
+    .date-filter-trigger[aria-expanded="true"] { border-color:var(--primary); box-shadow:0 0 0 3px rgba(139, 134, 128, .22); }
+    .date-filter-icon { flex:none; width:14px; height:14px; color:var(--primary); }
+    .date-filter-value { max-width:154px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-weight:400; color:var(--text); }
     .date-filter-clear { position:absolute; top:50%; right:8px; width:18px; height:18px; display:flex; align-items:center; justify-content:center; transform:translateY(-50%); border:0; border-radius:50%; padding:0; background:transparent; color:#98a2b3; font-size:18px; line-height:1; opacity:0; }
     .date-filter-clear[hidden] { display:none; }
     .date-filter-trigger.has-value + .date-filter-clear { display:flex; }
     .date-filter-control:hover .date-filter-clear, .date-filter-control:focus-within .date-filter-clear { opacity:1; }
-    .date-filter-clear:hover { color:#667085; background:#eef2f7; }
-    .date-filter-popover { position:absolute; right:0; left:auto; top:calc(100% + 8px); width:438px; min-height:302px; padding:0; display:grid; grid-template-columns:56px minmax(0, 1fr); background:#fff; border:1px solid var(--line); border-radius:3px; box-shadow:0 12px 30px rgba(15, 23, 42, .14); z-index:5; }
-    .date-filter-popover::before { content:""; position:absolute; top:-6px; right:40px; left:auto; width:10px; height:10px; background:#fff; border-left:1px solid var(--line); border-top:1px solid var(--line); transform:rotate(45deg); }
+    .date-filter-clear:hover { color:var(--text); background:var(--hover); }
+    .date-filter-popover { position:absolute; right:0; left:auto; top:calc(100% + 8px); width:438px; min-height:302px; padding:0; display:grid; grid-template-columns:56px minmax(0, 1fr); background:var(--surface); border:1px solid var(--line); border-radius:8px; box-shadow:var(--shadow-lg); z-index:5; overflow:hidden; }
+    .date-filter-popover::before { content:""; position:absolute; top:-6px; right:40px; left:auto; width:10px; height:10px; background:var(--surface); border-left:1px solid var(--line); border-top:1px solid var(--line); transform:rotate(45deg); }
     .date-filter-popover[hidden] { display:none; }
-    .date-filter-menu { padding:18px 10px; border-right:1px solid var(--line); display:grid; align-content:start; gap:6px; background:#fff; }
-    .date-filter-menu button { display:flex; align-items:center; justify-content:center; border:1px solid transparent; border-radius:3px; height:34px; background:transparent; color:#1f2937; font-weight:400; line-height:1; letter-spacing:0; }
-    .date-filter-menu button.active { background:#eef6ff; color:#1f2937; box-shadow:none; }
-    .date-filter-panel { min-width:0; display:flex; flex-direction:column; background:#fff; }
+    .date-filter-menu { padding:18px 10px; border-right:1px solid var(--line); display:grid; align-content:start; gap:6px; background:var(--surface); }
+    .date-filter-menu button { display:flex; align-items:center; justify-content:center; border:1px solid transparent; border-radius:8px; height:34px; background:transparent; color:var(--text); font-weight:400; line-height:1; letter-spacing:0; }
+    .date-filter-menu button.active { background:rgba(139, 134, 128, .14); color:var(--text); box-shadow:none; }
+    .date-filter-panel { min-width:0; display:flex; flex-direction:column; background:var(--surface); }
     .date-filter-head { display:grid; grid-template-columns:32px 32px 1fr 32px 32px; align-items:center; gap:2px; padding:11px 14px 8px; }
     .date-filter-head.compact { grid-template-columns:32px 1fr 32px; }
     .date-filter-head strong { text-align:center; font-size:16px; font-weight:500; }
-    .date-nav { width:28px; height:28px; padding:0; border:0; background:#fff; color:#4a5568; font-size:18px; line-height:1; }
-    .date-nav:hover { color:var(--blue); background:#f4f8ff; }
+    .date-nav { width:28px; height:28px; padding:0; border:0; background:var(--surface); color:var(--muted); font-size:18px; line-height:1; }
+    .date-nav:hover { color:var(--text); background:var(--hover); }
     .date-filter-grid { flex:1; display:grid; padding:0 16px 14px; }
     .date-filter-grid.day { grid-template-columns:repeat(7, minmax(0, 1fr)); grid-auto-rows:36px; }
     .date-filter-grid.month, .date-filter-grid.year { grid-template-columns:repeat(4, minmax(0, 1fr)); grid-auto-rows:64px; padding-top:8px; }
     .date-weekday, .date-cell { min-width:0; display:flex; align-items:center; justify-content:center; font-size:12px; }
     .date-filter-grid.month .date-cell, .date-filter-grid.year .date-cell { font-family:inherit; font-size:12px; font-weight:400; line-height:1; }
-    .date-weekday { color:#344054; font-weight:500; }
-    .date-cell { width:100%; height:32px; margin:auto; border:1px solid transparent; border-radius:0; background:transparent; cursor:pointer; padding:0; color:#2f3a4a; }
-    .date-cell:hover { color:var(--blue); background:#f2f7ff; }
-    .date-cell.outside { color:#aab4c3; background:#f6f8fb; }
-    .date-cell.today:not(.selected) { color:#2f3a4a; font-weight:400; }
-    .date-cell.selected { width:72%; border-radius:4px; color:#1677ff; border-color:transparent; background:#eef6ff; box-shadow:none; font-weight:400; }
+    .date-weekday { color:var(--muted); font-weight:500; }
+    .date-cell { width:100%; height:32px; margin:auto; border:1px solid transparent; border-radius:0; background:transparent; cursor:pointer; padding:0; color:var(--text); }
+    .date-cell:hover { color:var(--text); background:var(--hover); }
+    .date-cell.outside { color:var(--muted-soft); background:transparent; }
+    .date-cell.today:not(.selected) { color:var(--text); font-weight:400; }
+    .date-cell.selected { width:72%; border-radius:4px; color:#fff; border-color:var(--primary); background:var(--primary); box-shadow:none; font-weight:700; }
     .grid { display:grid; gap:14px; }
     .kpis { grid-template-columns: repeat(5, minmax(150px, 1fr)); }
     .two { grid-template-columns: 1.2fr .8fr; margin-top:14px; }
-    .panel { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:14px; min-width:0; }
+    .panel { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:14px; min-width:0; box-shadow:var(--shadow); }
+    .table-panel { background:var(--panel); }
     .chart-stack .hour-panel { grid-column:1 / -1; }
     .panel h2 { margin:0 0 12px; font-size:15px; }
     .panel-head { display:flex; align-items:center; justify-content:space-between; gap:10px; margin:0 0 12px; }
     .panel-head h2 { margin:0; }
     .heading-count { margin-left:4px; color:var(--muted); font-weight:600; }
-    .icon-button { width:30px; height:30px; display:inline-flex; align-items:center; justify-content:center; padding:0; border-radius:6px; color:#344054; }
-    .icon-button:hover { color:var(--blue); background:#f4f8ff; }
+    .icon-button { width:30px; height:30px; display:inline-flex; align-items:center; justify-content:center; padding:0; border-radius:8px; color:var(--muted); }
+    .icon-button:hover { color:var(--text); background:var(--hover); }
     .icon-button:disabled { cursor:wait; opacity:.7; }
     .refresh-icon { width:16px; height:16px; }
     .quota-refreshing .refresh-icon { animation:spin .8s linear infinite; }
@@ -904,29 +976,37 @@ DASHBOARD_HTML = r"""<!doctype html>
     .kpi .label { color:var(--muted); font-size:12px; }
     .kpi .value { font-size:24px; font-weight:700; margin-top:6px; }
     .kpi .sub { color:var(--muted); font-size:12px; margin-top:4px; }
-    table { width:100%; border-collapse:collapse; font-size:13px; }
-    th, td { text-align:left; border-bottom:1px solid var(--line); padding:8px; white-space:nowrap; }
-    th { color:var(--muted); font-weight:600; }
+    table { width:100%; border-collapse:separate; border-spacing:0; font-size:13px; border:1px solid var(--line); border-radius:8px; overflow:hidden; background:var(--surface); }
+    thead, tbody, tr, th, td { background:var(--surface); }
+    th, td { text-align:left; border-bottom:1px solid var(--line); padding:8px; white-space:nowrap; background:var(--surface); background-clip:padding-box; }
+    th { color:var(--muted); font-weight:700; }
+    tbody tr:hover td { background:var(--row-hover); }
+    tbody tr:last-child td { border-bottom:0; }
     td.num, th.num { text-align:right; }
     .scroll { overflow:auto; max-height:420px; }
-    .status { display:inline-flex; align-items:center; gap:6px; }
-    .request-status { font-weight:600; }
-    .request-status.success { color:var(--green); }
-    .request-status.failed { color:var(--red); }
+    .status { display:inline-flex; align-items:center; gap:6px; color:var(--green); background:transparent; border:0; border-radius:0; padding:0; font-weight:700; }
+    .status.bad { color:var(--red); }
+    .request-status { display:inline-flex; align-items:center; justify-content:center; border:1px solid var(--line); border-radius:9999px; padding:2px 8px; font-size:12px; font-weight:700; }
+    .request-status.success { color:var(--green-text); background:var(--green-bg); border-color:var(--green-border); }
+    .request-status.failed { color:var(--red-text); background:var(--red-bg); border-color:var(--red-border); }
     .dot { width:8px; height:8px; border-radius:50%; display:inline-block; background:var(--green); }
     .dot.bad { background:var(--red); }
     .muted { color:var(--muted); }
     canvas { width:100%; height:260px; display:block; }
-    .bar { height:9px; background:#edf1f7; border-radius:999px; overflow:hidden; min-width:90px; }
+    .bar { height:9px; background:var(--hover); border-radius:999px; overflow:hidden; min-width:90px; }
     .bar > span { display:block; height:100%; background:var(--green); }
     .bar > span.warn { background:var(--amber); }
     .bar > span.bad { background:var(--red); }
+    .quota-percent { font-weight:700; }
+    .quota-percent.good { color:var(--green); }
+    .quota-percent.warn { color:var(--amber); }
+    .quota-percent.bad { color:var(--red); }
     .api-panel { min-height:302px; }
     .api-list { display:grid; gap:10px; max-height:260px; overflow:auto; padding-right:2px; }
-    .api-card { position:relative; border:1px solid var(--line); border-radius:6px; padding:12px; background:#fbfaf7; }
+    .api-card { position:relative; border:1px solid var(--line); border-radius:8px; padding:12px; background:var(--surface); }
     .api-key { font-weight:700; margin-bottom:8px; }
     .api-metrics { display:flex; gap:6px; flex-wrap:wrap; color:var(--muted); font-size:12px; }
-    .api-pill { display:inline-flex; align-items:center; gap:4px; border-radius:999px; background:#f0f1ed; padding:4px 8px; }
+    .api-pill { display:inline-flex; align-items:center; gap:4px; border:1px solid var(--line); border-radius:999px; background:var(--surface-soft); padding:4px 8px; }
     .api-success { color:var(--green); }
     .api-failed { color:var(--red); }
     .api-empty { color:var(--muted); padding:20px 0; }
@@ -934,6 +1014,7 @@ DASHBOARD_HTML = r"""<!doctype html>
   </style>
 </head>
 <body>
+  <div class="toast-stack" id="toastStack" aria-live="polite" aria-atomic="true"></div>
   <header>
     <h1>CLIProxyAPI 用量统计</h1>
     <div class="toolbar">
@@ -984,10 +1065,10 @@ DASHBOARD_HTML = r"""<!doctype html>
       <div class="panel model-panel"><h2>模型消耗</h2><canvas id="modelChart" width="520" height="260"></canvas></div>
     </section>
     <section class="grid two">
-      <div class="panel"><h2>账号消耗</h2><div class="scroll"><table><thead><tr><th>账号</th><th class="num">请求</th><th class="num">总 Token</th><th class="num">输入</th><th class="num">输出</th><th class="num">推理</th><th class="num">失败</th></tr></thead><tbody id="accounts"></tbody></table></div></div>
-      <div class="panel"><div class="panel-head"><h2>账号余量<span class="heading-count" id="quotaAccountCount">（0）</span></h2><button type="button" class="icon-button quota-refresh" id="quotaRefresh" aria-label="刷新账号余量" title="刷新账号余量"><svg class="refresh-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M21 12a9 9 0 0 1-15.1 6.6M3 12a9 9 0 0 1 15.1-6.6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M18 3v4h-4M6 21v-4h4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></button></div><div class="scroll"><table><thead><tr><th>账号</th><th>状态</th><th>5h 剩余</th><th>7d 剩余</th><th>重置时间</th></tr></thead><tbody id="quotas"></tbody></table></div></div>
+      <div class="panel table-panel"><h2>账号消耗</h2><div class="scroll"><table><thead><tr><th>账号</th><th class="num">请求</th><th class="num">总 Token</th><th class="num">输入</th><th class="num">输出</th><th class="num">推理</th><th class="num">失败</th></tr></thead><tbody id="accounts"></tbody></table></div></div>
+      <div class="panel table-panel"><div class="panel-head"><h2>账号余量<span class="heading-count" id="quotaAccountCount">（0）</span></h2><button type="button" class="icon-button quota-refresh" id="quotaRefresh" aria-label="刷新账号余量" title="刷新账号余量"><svg class="refresh-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M21 12a9 9 0 0 1-15.1 6.6M3 12a9 9 0 0 1 15.1-6.6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M18 3v4h-4M6 21v-4h4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></button></div><div class="scroll"><table><thead><tr><th>账号</th><th>状态</th><th>5h 剩余</th><th>7d 剩余</th><th>重置时间</th></tr></thead><tbody id="quotas"></tbody></table></div></div>
     </section>
-    <section class="panel" style="margin-top:14px"><h2>最近每次请求/任务</h2><div class="scroll"><table><thead><tr><th>时间</th><th>账号</th><th>API</th><th>模型</th><th class="num">总 Token</th><th class="num">输入</th><th class="num">输出</th><th class="num">推理</th><th class="num">耗时</th><th>状态</th></tr></thead><tbody id="requests"></tbody></table></div></section>
+    <section class="panel table-panel" style="margin-top:14px"><h2>最近每次请求/任务</h2><div class="scroll"><table><thead><tr><th>时间</th><th>账号</th><th>API</th><th>模型</th><th class="num">总 Token</th><th class="num">输入</th><th class="num">输出</th><th class="num">推理</th><th class="num">耗时</th><th>状态</th></tr></thead><tbody id="requests"></tbody></table></div></section>
   </main>
 <script>
 const nf = new Intl.NumberFormat('zh-CN');
@@ -1029,7 +1110,43 @@ function drawValueLabel(ctx, text, centerX, barTop, occupiedLabels){
   }
   ctx.fillText(text, centerX, y);
 }
+function fillRoundedRect(ctx, x, y, width, height, radius){
+  if (width <= 0 || height <= 0) return;
+  const r = Math.max(0, Math.min(radius, width / 2, height / 2));
+  if (ctx.roundRect) {
+    ctx.beginPath();
+    ctx.roundRect(x, y, width, height, r);
+    ctx.fill();
+    return;
+  }
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.lineTo(x + width - r, y);
+  ctx.quadraticCurveTo(x + width, y, x + width, y + r);
+  ctx.lineTo(x + width, y + height - r);
+  ctx.quadraticCurveTo(x + width, y + height, x + width - r, y + height);
+  ctx.lineTo(x + r, y + height);
+  ctx.quadraticCurveTo(x, y + height, x, y + height - r);
+  ctx.lineTo(x, y + r);
+  ctx.quadraticCurveTo(x, y, x + r, y);
+  ctx.fill();
+}
 function esc(s){ return String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+function showToast(type, message){
+  const stack = $('toastStack');
+  if (!stack) return;
+  const toast = document.createElement('div');
+  const icon = type === 'success' ? '✓' : (type === 'warning' ? '!' : '×');
+  toast.className = `toast ${type}`;
+  toast.setAttribute('role', type === 'error' ? 'alert' : 'status');
+  toast.innerHTML = `<span class="toast-icon">${icon}</span><span>${esc(message)}</span>`;
+  stack.appendChild(toast);
+  const removeToast = () => {
+    toast.classList.add('removing');
+    setTimeout(() => toast.remove(), 220);
+  };
+  setTimeout(removeToast, 2600);
+}
 async function getJSON(url){ const r = await fetch(url); if(!r.ok) throw new Error(await r.text()); return r.json(); }
 const today = new Date();
 let calendarView = 'day';
@@ -1203,13 +1320,13 @@ function drawBars(canvas, rows, labelKey, valueKey, color){
     const x = pad.l + i * ((w-pad.l-pad.r) / Math.max(1, rows.length)) + bw*.3;
     const bh = (h-pad.t-pad.b) * Number(r[valueKey] || 0) / max;
     const y = h-pad.b-bh;
-    ctx.fillStyle = color; ctx.fillRect(x,y,bw,bh);
-    ctx.fillStyle = '#667085'; ctx.textAlign = 'center';
+    ctx.fillStyle = color; fillRoundedRect(ctx, x, y, bw, bh, 3);
+    ctx.fillStyle = '#6d6760'; ctx.textAlign = 'center';
     const label = String(r[labelKey] || r.label || r.bucket || '').slice(-5);
     ctx.fillText(label, x+bw/2, h-18);
-    if (Number(r[valueKey] || 0) > 0) { ctx.fillStyle = '#17202a'; drawValueLabel(ctx, chartValueLabel(r[valueKey]), x+bw/2, y, occupiedLabels); }
+    if (Number(r[valueKey] || 0) > 0) { ctx.fillStyle = '#2d2a26'; drawValueLabel(ctx, chartValueLabel(r[valueKey]), x+bw/2, y, occupiedLabels); }
   });
-  ctx.strokeStyle = '#d9dee7'; ctx.beginPath(); ctx.moveTo(pad.l,h-pad.b); ctx.lineTo(w-pad.r,h-pad.b); ctx.stroke();
+  ctx.strokeStyle = '#e3e1db'; ctx.beginPath(); ctx.moveTo(pad.l,h-pad.b); ctx.lineTo(w-pad.r,h-pad.b); ctx.stroke();
 }
 function drawDayBars(canvas, rows){
   const ctx = canvas.getContext('2d'), w = canvas.width, h = canvas.height;
@@ -1230,17 +1347,17 @@ function drawDayBars(canvas, rows){
       const x = startX + i * step + (step - bw) / 2;
       const bh = (h - pad.t - pad.b) * value / max;
       const y = h - pad.b - bh;
-      ctx.fillStyle = muted ? 'rgba(37, 99, 235, .42)' : '#2563eb';
-      ctx.fillRect(x, y, bw, bh);
+      ctx.fillStyle = muted ? 'rgba(16, 185, 129, .38)' : '#10b981';
+      fillRoundedRect(ctx, x, y, bw, bh, 3);
       const hour = Number(String(r.label || r.hour || '').slice(0, 2));
       const showLabel = !muted || hour % 2 === 0;
       if (showLabel) {
-        ctx.fillStyle = muted ? '#98a2b3' : '#667085';
+        ctx.fillStyle = muted ? '#a29c95' : '#6d6760';
         ctx.textAlign = 'center';
         ctx.fillText(String(r.label || r.hour || '').slice(0, 5), x + bw / 2, h - 18);
       }
       if (value > 0) {
-        ctx.fillStyle = '#17202a';
+        ctx.fillStyle = '#2d2a26';
         ctx.textAlign = 'center';
         drawValueLabel(ctx, chartValueLabel(value), x + bw / 2, y, occupiedLabels);
       }
@@ -1248,8 +1365,8 @@ function drawDayBars(canvas, rows){
   };
   drawSegment(rows.slice(0, weakEnd), pad.l, weakW, true);
   drawSegment(rows.slice(weakEnd), pad.l + weakW, normalW, false);
-  ctx.strokeStyle = '#d9dee7'; ctx.beginPath(); ctx.moveTo(pad.l,h-pad.b); ctx.lineTo(w-pad.r,h-pad.b); ctx.stroke();
-  ctx.strokeStyle = '#eef2f7';
+  ctx.strokeStyle = '#e3e1db'; ctx.beginPath(); ctx.moveTo(pad.l,h-pad.b); ctx.lineTo(w-pad.r,h-pad.b); ctx.stroke();
+  ctx.strokeStyle = '#e9e6df';
   ctx.beginPath(); ctx.moveTo(pad.l + weakW, pad.t); ctx.lineTo(pad.l + weakW, h - pad.b); ctx.stroke();
 }
 function drawHorizontal(canvas, rows){
@@ -1258,14 +1375,15 @@ function drawHorizontal(canvas, rows){
   const top = 12, rowH = 30, max = Math.max(1, ...rows.map(r => Number(r.total_tokens || 0)));
   rows.slice(0,8).forEach((r,i) => {
     const y = top + i * rowH; const labelW = 150; const barW = (w-labelW-90) * Number(r.total_tokens || 0) / max;
-    ctx.fillStyle = '#344054'; ctx.textAlign='left'; ctx.fillText(String(r.model || 'unknown').slice(0,22), 8, y+18);
-    ctx.fillStyle = '#0f9f6e'; ctx.fillRect(labelW, y+6, barW, 14);
-    ctx.fillStyle = '#667085'; ctx.fillText(fmt(r.total_tokens), labelW + barW + 8, y+18);
+    ctx.fillStyle = '#2d2a26'; ctx.textAlign='left'; ctx.fillText(String(r.model || 'unknown').slice(0,22), 8, y+18);
+    ctx.fillStyle = '#10b981'; fillRoundedRect(ctx, labelW, y+6, barW, 14, 4);
+    ctx.fillStyle = '#6d6760'; ctx.fillText(fmt(r.total_tokens), labelW + barW + 8, y+18);
   });
 }
 function quotaBar(v){
-  const cls = v <= 10 ? 'bad' : (v <= 30 ? 'warn' : '');
-  return `<div class="bar"><span class="${cls}" style="width:${Math.max(0, Math.min(100, v))}%"></span></div><span>${v}%</span>`;
+  v = Math.max(0, Math.min(100, Number(v) || 0));
+  const cls = v < 30 ? 'bad' : (v < 70 ? 'warn' : 'good');
+  return `<div class="bar"><span class="${cls}" style="width:${Math.max(0, Math.min(100, v))}%"></span></div><span class="quota-percent ${cls}">${v}%</span>`;
 }
 function renderApis(rows){
   rows = rows || [];
@@ -1287,7 +1405,7 @@ function renderApis(rows){
 function renderQuotas(rows){
   rows = rows || [];
   $('quotaAccountCount').textContent = `（${rows.length}）`;
-  $('quotas').innerHTML = rows.map(q => `<tr><td>${esc(q.email)}</td><td><span class="status"><span class="dot ${q.allowed ? '' : 'bad'}"></span>${q.allowed ? '可用' : '受限'}</span></td><td>${quotaBar(q.primary_remaining_percent)}</td><td>${quotaBar(q.secondary_remaining_percent)}</td><td><div>${esc(q.primary_reset_at)}</div><div class="muted">${esc(q.secondary_reset_at)}</div></td></tr>`).join('');
+  $('quotas').innerHTML = rows.map(q => `<tr><td>${esc(q.email)}</td><td><span class="status ${q.allowed ? '' : 'bad'}"><span class="dot ${q.allowed ? '' : 'bad'}"></span>${q.allowed ? '可用' : '受限'}</span></td><td>${quotaBar(q.primary_remaining_percent)}</td><td>${quotaBar(q.secondary_remaining_percent)}</td><td><div>${esc(q.primary_reset_at)}</div><div class="muted">${esc(q.secondary_reset_at)}</div></td></tr>`).join('');
 }
 function renderCollectorStatus(status){
   const el = $('collectorStatus');
@@ -1303,8 +1421,25 @@ async function refreshQuota(){
   try {
     const quota = await getJSON('/api/quota?force=1');
     renderQuotas(quota.quotas);
+    showToast('success', '账号余量刷新成功');
+  } catch (error) {
+    console.error(error);
+    showToast('error', '账号余量刷新失败');
   } finally {
     button.classList.remove('quota-refreshing');
+    button.disabled = false;
+  }
+}
+async function refreshDashboard(){
+  const button = $('refresh');
+  button.disabled = true;
+  try {
+    await load();
+    showToast('success', '刷新成功');
+  } catch (error) {
+    console.error(error);
+    showToast('error', '刷新失败');
+  } finally {
     button.disabled = false;
   }
 }
@@ -1330,12 +1465,12 @@ async function load(){
   if (summary.period?.type === 'day') {
     drawDayBars($('hourChart'), summary.hours);
   } else {
-    drawBars($('hourChart'), summary.hours, 'label', 'total_tokens', '#2563eb');
+    drawBars($('hourChart'), summary.hours, 'label', 'total_tokens', '#10b981');
   }
   drawHorizontal($('modelChart'), summary.models);
   renderCollectorStatus(collector);
 }
-$('refresh').onclick = () => load();
+$('refresh').onclick = () => refreshDashboard();
 $('quotaRefresh').onclick = () => refreshQuota();
 initDateFilter();
 load(); setInterval(() => load(), 30000);
@@ -1359,8 +1494,7 @@ def serve():
 def run():
     init_db()
     cfg = load_config()
-    collector = threading.Thread(target=collect_forever, name="usage-dashboard-collector", daemon=True)
-    collector.start()
+    collector_stop_event, _collector_watchdog = start_collector_watchdog()
 
     server = ThreadingHTTPServer((cfg["dashboard_host"], int(cfg["dashboard_port"])), DashboardHandler)
     print("collector started", flush=True)
@@ -1372,6 +1506,7 @@ def run():
     except KeyboardInterrupt:
         print("\nstopping collector and dashboard", flush=True)
     finally:
+        collector_stop_event.set()
         server.server_close()
 
 

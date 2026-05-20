@@ -1,6 +1,7 @@
 from pathlib import Path
 import datetime as dt
-import re
+import hashlib
+import json
 import tempfile
 import unittest
 
@@ -67,14 +68,88 @@ class DashboardHtmlTest(unittest.TestCase):
         self.assertIn("const startYear = Math.floor(currentYear / 10) * 10;", self.html)
         self.assertIn("${startYear}年 - ${startYear + 9}年", self.html)
 
-    def test_date_filter_view_tabs_are_centered_normal_weight_with_blue_active(self):
+    def test_dashboard_uses_management_center_visual_tokens(self):
+        self.assertIn("--bg:#faf9f5", self.html)
+        self.assertIn("--panel:#f0eee8", self.html)
+        self.assertIn("--surface:#fffdf9", self.html)
+        self.assertIn("--layer-1:var(--bg)", self.html)
+        self.assertIn("--layer-2:var(--panel)", self.html)
+        self.assertIn("--layer-3:var(--surface)", self.html)
+        self.assertIn("--primary:#8b8680", self.html)
+        self.assertIn("--green:#10b981", self.html)
+        self.assertIn("--amber:#e0aa14", self.html)
+        self.assertIn("--red:#c65746", self.html)
         self.assertRegex(
             self.html,
-            r"\.date-filter-menu button \{[^}]*display:flex;[^}]*align-items:center;[^}]*justify-content:center;[^}]*color:#1f2937;[^}]*font-weight:400;",
+            r"body \{[^}]*background:linear-gradient\(180deg, var\(--bg\), var\(--surface-soft\)\);",
         )
         self.assertRegex(
             self.html,
-            r"\.date-filter-menu button\.active \{[^}]*background:#eef6ff;",
+            r"\.panel \{[^}]*background:var\(--panel\);[^}]*border:1px solid var\(--line\);[^}]*border-radius:12px;",
+        )
+        self.assertRegex(
+            self.html,
+            r"button, select \{[^}]*background:var\(--panel\);[^}]*border-radius:8px;[^}]*font-weight:600;",
+        )
+        self.assertRegex(
+            self.html,
+            r"h1 \{[^}]*font-family:\"Arial Black\"[^}]*font-weight:900;[^}]*letter-spacing:0;",
+        )
+        self.assertIn("font-size:22px;", self.html)
+        self.assertIn("--row-hover:rgba(139, 134, 128, .08)", self.html)
+        self.assertIn(".api-card { position:relative; border:1px solid var(--line); border-radius:8px; padding:12px; background:var(--surface); }", self.html)
+
+    def test_quota_percentages_use_red_yellow_green_status_colors(self):
+        self.assertIn("const cls = v < 30 ? 'bad' : (v < 70 ? 'warn' : 'good');", self.html)
+        self.assertNotIn("v <= 20 ? 'bad'", self.html)
+        self.assertNotIn("const used = 100 - v;", self.html)
+        self.assertIn('class="quota-percent ${cls}"', self.html)
+        self.assertIn(".quota-percent.good { color:var(--green); }", self.html)
+        self.assertIn(".quota-percent.warn { color:var(--amber); }", self.html)
+        self.assertIn(".quota-percent.bad { color:var(--red); }", self.html)
+
+    def test_tables_and_statuses_follow_management_pill_style(self):
+        self.assertIn('<div class="panel table-panel"><h2>账号消耗</h2>', self.html)
+        self.assertIn('<div class="panel table-panel"><div class="panel-head"><h2>账号余量', self.html)
+        self.assertIn('<section class="panel table-panel" style="margin-top:14px">', self.html)
+        self.assertIn(".table-panel { background:var(--panel); }", self.html)
+        self.assertIn("thead, tbody, tr, th, td { background:var(--surface); }", self.html)
+        self.assertRegex(
+            self.html,
+            r"th, td \{[^}]*background:var\(--surface\);[^}]*background-clip:padding-box;",
+        )
+        self.assertIn("th { color:var(--muted); font-weight:700; }", self.html)
+        self.assertIn("tbody tr:hover td { background:var(--row-hover); }", self.html)
+        self.assertRegex(
+            self.html,
+            r"\.request-status \{[^}]*display:inline-flex;[^}]*border:1px solid var\(--line\);[^}]*border-radius:9999px;",
+        )
+        self.assertIn(".status { display:inline-flex; align-items:center; gap:6px; color:var(--green); background:transparent; border:0; border-radius:0; padding:0; font-weight:700; }", self.html)
+        self.assertIn(".status.bad { color:var(--red); }", self.html)
+        self.assertIn('class="status ${q.allowed ? \'\' : \'bad\'}"', self.html)
+        self.assertIn(".request-status.success { color:var(--green-text); background:var(--green-bg); border-color:var(--green-border); }", self.html)
+        self.assertIn(".request-status.failed { color:var(--red-text); background:var(--red-bg); border-color:var(--red-border); }", self.html)
+
+    def test_chart_colors_use_management_center_palette(self):
+        self.assertIn("drawBars($('hourChart'), summary.hours, 'label', 'total_tokens', '#10b981');", self.html)
+        self.assertIn("ctx.fillStyle = muted ? 'rgba(16, 185, 129, .38)' : '#10b981';", self.html)
+        self.assertIn("ctx.fillStyle = '#10b981'; fillRoundedRect(ctx, labelW, y+6, barW, 14, 4);", self.html)
+
+    def test_chart_bars_are_rounded(self):
+        self.assertIn("function fillRoundedRect(ctx, x, y, width, height, radius)", self.html)
+        self.assertIn("ctx.roundRect(x, y, width, height, r);", self.html)
+        self.assertIn("ctx.fillStyle = color; fillRoundedRect(ctx, x, y, bw, bh, 3);", self.html)
+        self.assertIn("fillRoundedRect(ctx, x, y, bw, bh, 3);", self.html)
+        self.assertIn("fillRoundedRect(ctx, labelW, y+6, barW, 14, 4);", self.html)
+
+    def test_date_filter_view_tabs_are_centered_normal_weight_with_neutral_active(self):
+        self.assertRegex(
+            self.html,
+            r"\.date-filter-menu button \{[^}]*display:flex;[^}]*align-items:center;[^}]*justify-content:center;[^}]*color:var\(--text\);[^}]*font-weight:400;",
+        )
+        self.assertRegex(
+            self.html,
+            r"\.date-filter-menu button\.active \{[^}]*background:rgba\(139, 134, 128, \.14\);",
         )
         self.assertNotIn(".date-filter-menu button.active { border-color:#d9dee7;", self.html)
 
@@ -82,16 +157,20 @@ class DashboardHtmlTest(unittest.TestCase):
         self.assertIn(".date-cell.selected {", self.html)
         self.assertRegex(
             self.html,
-            r"\.date-cell\.selected \{[^}]*border-color:transparent;[^}]*background:#eef6ff;",
+            r"\.date-cell\.selected \{[^}]*color:#fff;[^}]*border-color:var\(--primary\);[^}]*background:var\(--primary\);",
         )
         self.assertNotIn(".date-filter-grid.day .date-cell.selected", self.html)
         self.assertNotIn(".date-filter-grid.month .date-cell.selected", self.html)
         self.assertNotIn(".date-filter-grid.year .date-cell.selected", self.html)
 
+    def test_date_filter_outside_days_are_dim_without_fill(self):
+        self.assertIn(".date-cell.outside { color:var(--muted-soft); background:transparent; }", self.html)
+        self.assertNotIn(".date-cell.outside { color:var(--muted-soft); background:var(--surface-soft); }", self.html)
+
     def test_date_filter_today_cell_is_neutral_when_another_day_is_selected(self):
         self.assertRegex(
             self.html,
-            r"\.date-cell\.today:not\(\.selected\) \{[^}]*color:#2f3a4a;[^}]*font-weight:400;",
+            r"\.date-cell\.today:not\(\.selected\) \{[^}]*color:var\(--text\);[^}]*font-weight:400;",
         )
         self.assertNotIn(".date-cell.today:not(.selected) { color:#1677ff;", self.html)
 
@@ -164,6 +243,19 @@ class DashboardHtmlTest(unittest.TestCase):
         self.assertIn("$('quotaRefresh').onclick", self.html)
         self.assertIn("refreshQuota()", self.html)
 
+    def test_manual_refreshes_show_animated_toast_feedback(self):
+        self.assertIn('id="toastStack"', self.html)
+        self.assertIn("function showToast(type, message)", self.html)
+        self.assertIn("@keyframes toast-in", self.html)
+        self.assertIn("@keyframes toast-out", self.html)
+        self.assertIn("toast.remove()", self.html)
+        self.assertIn("async function refreshDashboard()", self.html)
+        self.assertIn("showToast('success', '刷新成功');", self.html)
+        self.assertIn("showToast('error', '刷新失败');", self.html)
+        self.assertIn("showToast('success', '账号余量刷新成功');", self.html)
+        self.assertIn("showToast('error', '账号余量刷新失败');", self.html)
+        self.assertIn("$('refresh').onclick = () => refreshDashboard();", self.html)
+
     def test_api_and_quota_panel_titles_show_dynamic_counts(self):
         self.assertIn('API 详细统计<span class="heading-count" id="apiKeyCount">（0）</span>', self.html)
         self.assertIn('账号余量<span class="heading-count" id="quotaAccountCount">（0）</span>', self.html)
@@ -178,7 +270,8 @@ class DashboardHtmlTest(unittest.TestCase):
         self.assertEqual(usage_dashboard.DEFAULT_CONFIG["quota_refresh_seconds"], 14400)
 
     def test_top_refresh_button_runs_normal_load(self):
-        self.assertIn("$('refresh').onclick = () => load();", self.html)
+        self.assertIn("$('refresh').onclick = () => refreshDashboard();", self.html)
+        self.assertRegex(self.html, r"async function refreshDashboard\(\)[\s\S]+await load\(\);")
         self.assertNotIn("$('refresh').onclick = () => refreshQuota();", self.html)
 
     def test_day_chart_compresses_muted_hours_and_keeps_work_hours_normal(self):
@@ -291,6 +384,68 @@ class DashboardPeriodSummaryTest(unittest.TestCase):
                 ),
             )
 
+    def test_insert_usage_redacts_api_key_from_raw_json(self):
+        secret_key = "test-api-key-value"
+        raw = json.dumps(
+            {
+                "timestamp": "2026-05-19T08:30:00Z",
+                "request_id": "request-with-key",
+                "source": "account-1",
+                "model": "gpt-test",
+                "auth_type": "api_key",
+                "api_key": secret_key,
+                "tokens": {"total_tokens": 42},
+            },
+            ensure_ascii=False,
+        )
+
+        inserted = usage_dashboard.insert_usage([raw])
+
+        self.assertEqual(inserted, 1)
+        with usage_dashboard.db_connect() as conn:
+            row = conn.execute(
+                "SELECT api_key_hash, raw_json FROM usage_events WHERE event_key = ?",
+                ("request-with-key",),
+            ).fetchone()
+        self.assertEqual(row["api_key_hash"], hashlib.sha256(secret_key.encode()).hexdigest()[:12])
+        self.assertNotIn(secret_key, row["raw_json"])
+        self.assertEqual(json.loads(row["raw_json"])["api_key"], "[redacted]")
+
+    def test_latest_quotas_do_not_expose_raw_json(self):
+        now = usage_dashboard.time.time()
+        with usage_dashboard.db_connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO quota_snapshots (
+                  timestamp,ts_epoch,email,plan,allowed,limit_reached,
+                  primary_used_percent,primary_remaining_percent,primary_reset_at,
+                  secondary_used_percent,secondary_remaining_percent,secondary_reset_at,
+                  credits_balance,raw_json
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    "2026-05-20T00:00:00+00:00",
+                    now,
+                    "account@example.test",
+                    "plus",
+                    1,
+                    0,
+                    10,
+                    90,
+                    "2026-05-20 12:00:00",
+                    20,
+                    80,
+                    "2026-05-27 12:00:00",
+                    "0",
+                    '{"internal":"not-for-api"}',
+                ),
+            )
+
+        quotas = usage_dashboard.latest_quotas()
+
+        self.assertEqual(len(quotas), 1)
+        self.assertNotIn("raw_json", quotas[0])
+
     def test_day_period_returns_24_hour_buckets_with_zero_fill(self):
         self.insert_usage(dt.datetime(2026, 5, 19, 8, 30), 100, "day-8")
         self.insert_usage(dt.datetime(2026, 5, 19, 18, 30), 200, "day-18")
@@ -372,6 +527,7 @@ class StartDashboardCmdTest(unittest.TestCase):
         content = (ROOT / "start_dashboard.cmd").read_text(encoding="utf-8")
 
         self.assertIn("usage_dashboard.py run", content)
+        self.assertIn('if not exist "%PY%" set "PY=python"', content)
         self.assertNotIn("usage_dashboard.py collect", content)
         self.assertNotIn("usage_dashboard.py serve", content)
         self.assertNotIn("Start-Process", content)
@@ -381,6 +537,37 @@ class StartDashboardCmdTest(unittest.TestCase):
 
     def test_dashboard_has_run_command_for_single_process_supervision(self):
         self.assertTrue(hasattr(usage_dashboard, "run"))
+
+    def test_run_uses_collector_watchdog(self):
+        source = Path(usage_dashboard.__file__).read_text(encoding="utf-8")
+        run_body = source.split("def run():", 1)[1].split("\ndef print_report", 1)[0]
+
+        self.assertTrue(hasattr(usage_dashboard, "start_collector_watchdog"))
+        self.assertIn("start_collector_watchdog()", run_body)
+        self.assertNotIn("threading.Thread(target=collect_forever", run_body)
+
+    def test_collector_watchdog_restarts_exited_target(self):
+        stop_event = usage_dashboard.threading.Event()
+        attempts = []
+
+        def target():
+            attempts.append(1)
+            if len(attempts) >= 2:
+                stop_event.set()
+
+        returned_event, watchdog = usage_dashboard.start_collector_watchdog(
+            restart_delay_seconds=0,
+            target=target,
+            stop_event=stop_event,
+        )
+        watchdog.join(1)
+
+        returned_event.set()
+        watchdog.join(1)
+
+        self.assertIs(returned_event, stop_event)
+        self.assertGreaterEqual(len(attempts), 2)
+        self.assertFalse(watchdog.is_alive())
 
 
 class ConfigLoadTest(unittest.TestCase):

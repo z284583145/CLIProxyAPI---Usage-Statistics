@@ -198,6 +198,8 @@ start_dashboard.cmd
 - 采集器：持续从 CLIProxyAPI 用量队列采集数据
 - 网页面板：监听 `http://127.0.0.1:8320`
 
+脚本会优先使用本机 Codex runtime Python；如果该路径不存在，会回退到 PATH 中的 `python`。
+
 浏览器访问：
 
 ```text
@@ -307,6 +309,8 @@ GET /api/requests?limit=100&period_type=day&period_key=2026-05-19
 
 `/api/requests` 也支持同样的 `period_type` / `period_key` 参数，用于让“最近每次请求/任务”跟随日期选择器过滤；不传时返回全局最新请求。
 
+`/api/quota` 只返回页面展示需要的余量字段，不返回本地保存的 `raw_json`。
+
 ## 数据文件
 
 默认文件位置：
@@ -322,6 +326,12 @@ GET /api/requests?limit=100&period_type=day&period_key=2026-05-19
 - 运行目录中的 `config.json` 包含本地管理密钥，不能提交；仓库根目录的 `config.json` 是脱敏模板。
 - `usage.sqlite` 包含账号名和用量统计，不能提交。
 - `logs/` 可能包含运行错误信息，不能提交。
+
+## 发布与回滚
+
+发布前的 lint、测试、构建、冒烟、兼容性、安全扫描和上线后验证步骤维护在 [docs/deployment.md](docs/deployment.md)。
+
+本次及后续发布变更记录维护在 [CHANGELOG.md](CHANGELOG.md)。生产回滚时优先切回上一版 `usage_dashboard.py`，本次版本没有新增 SQLite schema 字段，通常不需要回滚数据库；如需恢复数据状态，应在停止服务后恢复发布前备份的 `usage.sqlite` 及其 WAL/SHM 文件。
 
 ## 安全与脱敏
 
@@ -359,6 +369,8 @@ git grep -n -I "refresh_token\|id_token\|gho_\|Bearer [A-Za-z0-9]\|chatgpt_accou
 ```
 
 如果命中真实值，不要发布，先清理 git 历史。
+
+采集请求事件时，`api_key_hash` 用于聚合统计；`raw_json` 会在入库前替换 `api_key`、`authorization`、`access_token`、`refresh_token` 和 `id_token` 等敏感字段，避免完整密钥进入 SQLite。
 
 ## 限制
 
