@@ -31,11 +31,55 @@ DEFAULT_CONFIG = {
     "cliproxy_port": 8317,
     "management_key": "",
     "poll_interval_seconds": 2,
-    "quota_refresh_seconds": 7200,
+    "quota_refresh_seconds": 14400,
     "dashboard_host": "127.0.0.1",
     "dashboard_port": 8320,
     "cliproxy_config_path": DEFAULT_CLIPROXY_CONFIG_PATH,
 }
+
+COLLECTOR_STATUS = {
+    "ok": False,
+    "status": "异常",
+    "message": "采集器未启动",
+    "last_success_at": None,
+    "last_error_at": None,
+    "last_error": "",
+}
+COLLECTOR_STATUS_LOCK = threading.Lock()
+
+
+def local_now_text():
+    return dt.datetime.now(LOCAL_TZ).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def mark_collector_success(message="采集正常"):
+    with COLLECTOR_STATUS_LOCK:
+        COLLECTOR_STATUS.update(
+            {
+                "ok": True,
+                "status": "正常",
+                "message": message,
+                "last_success_at": local_now_text(),
+            }
+        )
+
+
+def mark_collector_error(exc):
+    with COLLECTOR_STATUS_LOCK:
+        COLLECTOR_STATUS.update(
+            {
+                "ok": False,
+                "status": "异常",
+                "message": "采集异常",
+                "last_error_at": local_now_text(),
+                "last_error": str(exc),
+            }
+        )
+
+
+def collector_status():
+    with COLLECTOR_STATUS_LOCK:
+        return dict(COLLECTOR_STATUS)
 
 
 def ensure_dirs():
@@ -45,10 +89,10 @@ def ensure_dirs():
 def load_config():
     ensure_dirs()
     if not os.path.exists(CONFIG_PATH):
-        with open(CONFIG_PATH, "w") as f:
+        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
             json.dump(DEFAULT_CONFIG, f, indent=2)
         os.chmod(CONFIG_PATH, 0o600)
-    with open(CONFIG_PATH) as f:
+    with open(CONFIG_PATH, encoding="utf-8-sig") as f:
         cfg = json.load(f)
     merged = dict(DEFAULT_CONFIG)
     merged.update(cfg)
@@ -280,7 +324,7 @@ def auth_files():
 def refresh_quota(force=False):
     cfg = load_config()
     age = latest_quota_age()
-    if not force and age is not None and age < cfg["quota_refresh_seconds"]:
+    if not force and age is not None and age < int(cfg["quota_refresh_seconds"]):
         return 0
     now = dt.datetime.now(dt.timezone.utc)
     inserted = 0
@@ -355,18 +399,20 @@ def collect_forever():
             try:
                 while True:
                     raw_items = client.rpop(100)
+                    mark_collector_success()
                     if raw_items:
                         inserted = insert_usage(raw_items)
                         if inserted:
                             print(f"inserted {inserted} usage events", flush=True)
                     now = time.time()
-                    if now - last_quota >= cfg["quota_refresh_seconds"]:
+                    if now - last_quota >= int(cfg["quota_refresh_seconds"]):
                         refresh_quota(force=True)
                         last_quota = now
                     time.sleep(cfg["poll_interval_seconds"])
             finally:
                 client.close()
         except Exception as exc:
+            mark_collector_error(exc)
             print(f"collector error: {exc}", file=sys.stderr, flush=True)
             time.sleep(5)
 
@@ -620,6 +666,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
             elif parsed.path == "/api/requests":
                 limit = min(500, int(qs.get("limit", ["100"])[0]))
                 json_response(self, {"requests": recent_requests(limit)})
+            elif parsed.path == "/api/collector-status":
+                json_response(self, collector_status())
             elif parsed.path == "/api/health":
                 json_response(self, {"ok": True, "db": DB_PATH, "auth_files": len(auth_files())})
             else:
@@ -652,6 +700,8 @@ DASHBOARD_HTML = r"""<!doctype html>
     button, select { border:1px solid var(--line); background:#fff; color:var(--text); border-radius:6px; padding:8px 10px; font-size:14px; }
     button.primary { background:var(--blue); color:#fff; border-color:var(--blue); }
     .toolbar { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
+    .collector-status { min-width:96px; color:var(--red); font-size:13px; font-weight:700; }
+    .collector-status.ok { color:var(--green); }
     .date-filter { position:relative; }
     .date-filter-control { position:relative; }
     .date-filter-trigger { height:38px; min-width:218px; display:flex; align-items:center; justify-content:flex-start; gap:8px; padding:8px 32px 8px 12px; background:#fff; border-radius:4px; }
@@ -663,8 +713,8 @@ DASHBOARD_HTML = r"""<!doctype html>
     .date-filter-trigger.has-value + .date-filter-clear { display:flex; }
     .date-filter-control:hover .date-filter-clear, .date-filter-control:focus-within .date-filter-clear { opacity:1; }
     .date-filter-clear:hover { color:#667085; background:#eef2f7; }
-    .date-filter-popover { position:absolute; left:0; top:calc(100% + 8px); width:438px; min-height:302px; padding:0; display:grid; grid-template-columns:110px minmax(0, 1fr); background:#fff; border:1px solid var(--line); border-radius:3px; box-shadow:0 12px 30px rgba(15, 23, 42, .14); z-index:5; }
-    .date-filter-popover::before { content:""; position:absolute; top:-6px; left:40px; width:10px; height:10px; background:#fff; border-left:1px solid var(--line); border-top:1px solid var(--line); transform:rotate(45deg); }
+    .date-filter-popover { position:absolute; right:0; left:auto; top:calc(100% + 8px); width:438px; min-height:302px; padding:0; display:grid; grid-template-columns:56px minmax(0, 1fr); background:#fff; border:1px solid var(--line); border-radius:3px; box-shadow:0 12px 30px rgba(15, 23, 42, .14); z-index:5; }
+    .date-filter-popover::before { content:""; position:absolute; top:-6px; right:40px; left:auto; width:10px; height:10px; background:#fff; border-left:1px solid var(--line); border-top:1px solid var(--line); transform:rotate(45deg); }
     .date-filter-popover[hidden] { display:none; }
     .date-filter-menu { padding:18px 10px; border-right:1px solid var(--line); display:grid; align-content:start; gap:6px; background:#fff; }
     .date-filter-menu button { display:flex; align-items:center; justify-content:center; border:1px solid transparent; border-radius:3px; height:34px; background:transparent; color:#1f2937; font-weight:400; line-height:1; letter-spacing:0; }
@@ -684,7 +734,7 @@ DASHBOARD_HTML = r"""<!doctype html>
     .date-cell { width:100%; height:32px; margin:auto; border:1px solid transparent; border-radius:0; background:transparent; cursor:pointer; padding:0; color:#2f3a4a; }
     .date-cell:hover { color:var(--blue); background:#f2f7ff; }
     .date-cell.outside { color:#aab4c3; background:#f6f8fb; }
-    .date-cell.today:not(.selected) { color:#1677ff; font-weight:700; }
+    .date-cell.today:not(.selected) { color:#2f3a4a; font-weight:400; }
     .date-cell.selected { width:72%; border-radius:4px; color:#1677ff; border-color:transparent; background:#eef6ff; box-shadow:none; font-weight:400; }
     .grid { display:grid; gap:14px; }
     .kpis { grid-template-columns: repeat(5, minmax(150px, 1fr)); }
@@ -692,6 +742,15 @@ DASHBOARD_HTML = r"""<!doctype html>
     .panel { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:14px; min-width:0; }
     .chart-stack .hour-panel { grid-column:1 / -1; }
     .panel h2 { margin:0 0 12px; font-size:15px; }
+    .panel-head { display:flex; align-items:center; justify-content:space-between; gap:10px; margin:0 0 12px; }
+    .panel-head h2 { margin:0; }
+    .heading-count { margin-left:4px; color:var(--muted); font-weight:600; }
+    .icon-button { width:30px; height:30px; display:inline-flex; align-items:center; justify-content:center; padding:0; border-radius:6px; color:#344054; }
+    .icon-button:hover { color:var(--blue); background:#f4f8ff; }
+    .icon-button:disabled { cursor:wait; opacity:.7; }
+    .refresh-icon { width:16px; height:16px; }
+    .quota-refreshing .refresh-icon { animation:spin .8s linear infinite; }
+    @keyframes spin { to { transform:rotate(360deg); } }
     .kpi .label { color:var(--muted); font-size:12px; }
     .kpi .value { font-size:24px; font-weight:700; margin-top:6px; }
     .kpi .sub { color:var(--muted); font-size:12px; margin-top:4px; }
@@ -721,13 +780,14 @@ DASHBOARD_HTML = r"""<!doctype html>
     .api-success { color:var(--green); }
     .api-failed { color:var(--red); }
     .api-empty { color:var(--muted); padding:20px 0; }
-    @media (max-width: 900px) { .kpis, .two { grid-template-columns:1fr; } header { align-items:flex-start; flex-direction:column; } .date-filter-popover { width:min(438px, calc(100vw - 48px)); grid-template-columns:74px minmax(0, 1fr); } .date-filter-menu { padding-top:14px; } }
+    @media (max-width: 900px) { .kpis, .two { grid-template-columns:1fr; } header { align-items:flex-start; flex-direction:column; } .date-filter-popover { left:0; right:auto; width:min(438px, calc(100vw - 48px)); grid-template-columns:56px minmax(0, 1fr); } .date-filter-popover::before { left:40px; right:auto; } .date-filter-menu { padding-top:14px; } }
   </style>
 </head>
 <body>
   <header>
     <h1>CLIProxyAPI 用量统计</h1>
     <div class="toolbar">
+      <span class="collector-status" id="collectorStatus">采集状态：异常</span>
       <div class="date-filter" id="dateFilter">
         <div class="date-filter-control">
           <button type="button" class="date-filter-trigger" id="dateFilterTrigger" aria-expanded="false" aria-controls="dateFilterPopover">
@@ -765,8 +825,6 @@ DASHBOARD_HTML = r"""<!doctype html>
         <option value="7d">最近 7 天</option>
       </select>
       <button id="refresh">刷新</button>
-      <button id="quota" class="primary">刷新余量</button>
-      <span id="updated" class="muted"></span>
     </div>
   </header>
   <main>
@@ -779,12 +837,12 @@ DASHBOARD_HTML = r"""<!doctype html>
     </section>
     <section class="grid two chart-stack">
       <div class="panel hour-panel"><h2>按小时消耗</h2><canvas id="hourChart" width="900" height="260"></canvas></div>
-      <div class="panel api-panel"><h2>API 详细统计</h2><div class="api-list" id="apiDetails"></div></div>
+      <div class="panel api-panel"><h2>API 详细统计<span class="heading-count" id="apiKeyCount">（0）</span></h2><div class="api-list" id="apiDetails"></div></div>
       <div class="panel model-panel"><h2>模型消耗</h2><canvas id="modelChart" width="520" height="260"></canvas></div>
     </section>
     <section class="grid two">
       <div class="panel"><h2>账号消耗</h2><div class="scroll"><table><thead><tr><th>账号</th><th class="num">请求</th><th class="num">总 Token</th><th class="num">输入</th><th class="num">输出</th><th class="num">推理</th><th class="num">失败</th></tr></thead><tbody id="accounts"></tbody></table></div></div>
-      <div class="panel"><h2>账号余量</h2><div class="scroll"><table><thead><tr><th>账号</th><th>状态</th><th>5h 剩余</th><th>7d 剩余</th><th>重置时间</th></tr></thead><tbody id="quotas"></tbody></table></div></div>
+      <div class="panel"><div class="panel-head"><h2>账号余量<span class="heading-count" id="quotaAccountCount">（0）</span></h2><button type="button" class="icon-button quota-refresh" id="quotaRefresh" aria-label="刷新账号余量" title="刷新账号余量"><svg class="refresh-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M21 12a9 9 0 0 1-15.1 6.6M3 12a9 9 0 0 1 15.1-6.6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M18 3v4h-4M6 21v-4h4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></button></div><div class="scroll"><table><thead><tr><th>账号</th><th>状态</th><th>5h 剩余</th><th>7d 剩余</th><th>重置时间</th></tr></thead><tbody id="quotas"></tbody></table></div></div>
     </section>
     <section class="panel" style="margin-top:14px"><h2>最近每次请求/任务</h2><div class="scroll"><table><thead><tr><th>时间</th><th>账号</th><th>API</th><th>模型</th><th class="num">总 Token</th><th class="num">输入</th><th class="num">输出</th><th class="num">推理</th><th class="num">耗时</th><th>状态</th></tr></thead><tbody id="requests"></tbody></table></div></section>
   </main>
@@ -977,6 +1035,8 @@ function quotaBar(v){
   return `<div class="bar"><span class="${cls}" style="width:${Math.max(0, Math.min(100, v))}%"></span></div><span>${v}%</span>`;
 }
 function renderApis(rows){
+  rows = rows || [];
+  $('apiKeyCount').textContent = `（${rows.length}）`;
   if (!rows || !rows.length) {
     $('apiDetails').innerHTML = '<div class="api-empty">暂无 API 数据</div>';
     return;
@@ -991,30 +1051,57 @@ function renderApis(rows){
     </div>
   `).join('');
 }
-async function load(forceQuota=false){
+function renderQuotas(rows){
+  rows = rows || [];
+  $('quotaAccountCount').textContent = `（${rows.length}）`;
+  $('quotas').innerHTML = rows.map(q => `<tr><td>${esc(q.email)}</td><td><span class="status"><span class="dot ${q.allowed ? '' : 'bad'}"></span>${q.allowed ? '可用' : '受限'}</span></td><td>${quotaBar(q.primary_remaining_percent)}</td><td>${quotaBar(q.secondary_remaining_percent)}</td><td><div>${esc(q.primary_reset_at)}</div><div class="muted">${esc(q.secondary_reset_at)}</div></td></tr>`).join('');
+}
+function renderCollectorStatus(status){
+  const el = $('collectorStatus');
+  const ok = Boolean(status && status.ok);
+  el.textContent = '采集状态：' + (ok ? '正常' : '异常');
+  el.classList.toggle('ok', ok);
+  el.title = status?.last_error || status?.last_success_at || '';
+}
+async function refreshQuota(){
+  const button = $('quotaRefresh');
+  button.disabled = true;
+  button.classList.add('quota-refreshing');
+  try {
+    const quota = await getJSON('/api/quota?force=1');
+    renderQuotas(quota.quotas);
+  } finally {
+    button.classList.remove('quota-refreshing');
+    button.disabled = false;
+  }
+}
+async function load(){
   const range = $('range').value;
-  const [summary, quota, reqs] = await Promise.all([
+  const [summary, quota, reqs, collector] = await Promise.all([
     getJSON('/api/summary?range=' + encodeURIComponent(range)),
-    getJSON('/api/quota' + (forceQuota ? '?force=1' : '')),
-    getJSON('/api/requests?limit=120')
+    getJSON('/api/quota'),
+    getJSON('/api/requests?limit=120'),
+    getJSON('/api/collector-status')
   ]);
   const s = summary.summary;
   $('kReq').textContent = fmt(s.requests); $('kFail').textContent = '失败 ' + fmt(s.failed);
   $('kTok').textContent = fmt(s.total_tokens); $('kIn').textContent = fmt(s.input_tokens);
   $('kOut').textContent = fmt(s.output_tokens); $('kReason').textContent = fmt(s.reasoning_tokens);
   $('accounts').innerHTML = summary.accounts.map(a => `<tr><td>${esc(a.account)}</td><td class="num">${fmt(a.requests)}</td><td class="num">${fmt(a.total_tokens)}</td><td class="num">${fmt(a.input_tokens)}</td><td class="num">${fmt(a.output_tokens)}</td><td class="num">${fmt(a.reasoning_tokens)}</td><td class="num">${fmt(a.failed)}</td></tr>`).join('');
-  $('quotas').innerHTML = quota.quotas.map(q => `<tr><td>${esc(q.email)}</td><td><span class="status"><span class="dot ${q.allowed ? '' : 'bad'}"></span>${q.allowed ? '可用' : '受限'}</span></td><td>${quotaBar(q.primary_remaining_percent)}</td><td>${quotaBar(q.secondary_remaining_percent)}</td><td><div>${esc(q.primary_reset_at)}</div><div class="muted">${esc(q.secondary_reset_at)}</div></td></tr>`).join('');
+  $('apiKeyCount').textContent = `（${summary.apis.length}）`;
+  $('quotaAccountCount').textContent = `（${quota.quotas.length}）`;
+  renderQuotas(quota.quotas);
   $('requests').innerHTML = reqs.requests.map(r => `<tr><td>${esc(r.local_time)}</td><td>${esc(r.source || r.auth_index)}</td><td>${esc(r.api_label)}</td><td>${esc(r.model)}</td><td class="num">${fmt(r.total_tokens)}</td><td class="num">${fmt(r.input_tokens)}</td><td class="num">${fmt(r.output_tokens)}</td><td class="num">${fmt(r.reasoning_tokens)}</td><td class="num">${fmt(r.latency_ms)}ms</td><td><span class="request-status ${r.failed ? 'failed' : 'success'}">${r.failed ? '失败' : '成功'}</span></td></tr>`).join('');
   renderApis(summary.apis);
   drawBars($('hourChart'), summary.hours, 'hour', 'total_tokens', '#2563eb');
   drawHorizontal($('modelChart'), summary.models);
-  $('updated').textContent = '更新于 ' + new Date().toLocaleTimeString('zh-CN');
+  renderCollectorStatus(collector);
 }
-$('refresh').onclick = () => load(false);
-$('quota').onclick = () => load(true);
-$('range').onchange = () => load(false);
+$('refresh').onclick = () => load();
+$('quotaRefresh').onclick = () => refreshQuota();
+$('range').onchange = () => load();
 initDateFilter();
-load(false); setInterval(() => load(false), 30000);
+load(); setInterval(() => load(), 30000);
 </script>
 </body>
 </html>

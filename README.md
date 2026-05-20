@@ -147,7 +147,7 @@ chmod 600 ~/.cli-proxy-api/usage-dashboard/config.json
   "cliproxy_port": 8317,
   "management_key": "replace-with-your-management-key",
   "poll_interval_seconds": 2,
-  "quota_refresh_seconds": 7200,
+  "quota_refresh_seconds": 14400,
   "dashboard_host": "127.0.0.1",
   "dashboard_port": 8320,
   "cliproxy_config_path": "../config.yaml"
