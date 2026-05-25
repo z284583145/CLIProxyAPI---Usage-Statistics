@@ -269,9 +269,13 @@ class DashboardHtmlTest(unittest.TestCase):
         self.assertNotIn("load(true)", self.html)
         self.assertEqual(usage_dashboard.DEFAULT_CONFIG["quota_refresh_seconds"], 14400)
 
-    def test_top_refresh_button_runs_normal_load(self):
+    def test_top_refresh_button_forces_quota_refresh_with_dashboard_data(self):
         self.assertIn("$('refresh').onclick = () => refreshDashboard();", self.html)
-        self.assertRegex(self.html, r"async function refreshDashboard\(\)[\s\S]+await load\(\);")
+        self.assertRegex(self.html, r"async function refreshDashboard\(\)[\s\S]+await load\(\{forceQuota: true\}\);")
+        self.assertRegex(
+            self.html,
+            r"async function load\(\{forceQuota = false\} = \{\}\)[\s\S]+forceQuota \? getJSON\('/api/quota\?force=1'\) : getJSON\('/api/quota'\)",
+        )
         self.assertNotIn("$('refresh').onclick = () => refreshQuota();", self.html)
 
     def test_day_chart_compresses_muted_hours_and_keeps_work_hours_normal(self):
@@ -331,10 +335,13 @@ class DashboardPeriodSummaryTest(unittest.TestCase):
         self.original_base_dir = usage_dashboard.BASE_DIR
         self.original_db_path = usage_dashboard.DB_PATH
         self.original_config_path = usage_dashboard.CONFIG_PATH
+        self.original_auth_dir = usage_dashboard.AUTH_DIR
         self.tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         usage_dashboard.BASE_DIR = self.tmp.name
         usage_dashboard.DB_PATH = str(Path(self.tmp.name) / "usage.sqlite")
         usage_dashboard.CONFIG_PATH = str(Path(self.tmp.name) / "config.json")
+        usage_dashboard.AUTH_DIR = str(Path(self.tmp.name) / "auth")
+        Path(usage_dashboard.AUTH_DIR).mkdir()
         Path(usage_dashboard.CONFIG_PATH).write_text(
             '{"management_key":"","cliproxy_config_path":""}',
             encoding="utf-8",
@@ -345,7 +352,14 @@ class DashboardPeriodSummaryTest(unittest.TestCase):
         usage_dashboard.BASE_DIR = self.original_base_dir
         usage_dashboard.DB_PATH = self.original_db_path
         usage_dashboard.CONFIG_PATH = self.original_config_path
+        usage_dashboard.AUTH_DIR = self.original_auth_dir
         self.tmp.cleanup()
+
+    def write_auth(self, email, filename="codex-current.json", token="token"):
+        Path(usage_dashboard.AUTH_DIR, filename).write_text(
+            json.dumps({"email": email, "access_token": token}, ensure_ascii=False),
+            encoding="utf-8",
+        )
 
     def insert_usage(self, local_time, total_tokens, event_key):
         ts_local = local_time.replace(tzinfo=usage_dashboard.LOCAL_TZ)
@@ -384,6 +398,36 @@ class DashboardPeriodSummaryTest(unittest.TestCase):
                 ),
             )
 
+    def insert_quota_snapshot(self, email, ts_epoch=None):
+        ts_epoch = usage_dashboard.time.time() if ts_epoch is None else ts_epoch
+        with usage_dashboard.db_connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO quota_snapshots (
+                  timestamp,ts_epoch,email,plan,allowed,limit_reached,
+                  primary_used_percent,primary_remaining_percent,primary_reset_at,
+                  secondary_used_percent,secondary_remaining_percent,secondary_reset_at,
+                  credits_balance,raw_json
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    "2026-05-20T00:00:00+00:00",
+                    ts_epoch,
+                    email,
+                    "plus",
+                    1,
+                    0,
+                    10,
+                    90,
+                    "2026-05-20 12:00:00",
+                    20,
+                    80,
+                    "2026-05-27 12:00:00",
+                    "0",
+                    '{"internal":"not-for-api"}',
+                ),
+            )
+
     def test_insert_usage_redacts_api_key_from_raw_json(self):
         secret_key = "test-api-key-value"
         raw = json.dumps(
@@ -412,39 +456,31 @@ class DashboardPeriodSummaryTest(unittest.TestCase):
         self.assertEqual(json.loads(row["raw_json"])["api_key"], "[redacted]")
 
     def test_latest_quotas_do_not_expose_raw_json(self):
-        now = usage_dashboard.time.time()
-        with usage_dashboard.db_connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO quota_snapshots (
-                  timestamp,ts_epoch,email,plan,allowed,limit_reached,
-                  primary_used_percent,primary_remaining_percent,primary_reset_at,
-                  secondary_used_percent,secondary_remaining_percent,secondary_reset_at,
-                  credits_balance,raw_json
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-                """,
-                (
-                    "2026-05-20T00:00:00+00:00",
-                    now,
-                    "account@example.test",
-                    "plus",
-                    1,
-                    0,
-                    10,
-                    90,
-                    "2026-05-20 12:00:00",
-                    20,
-                    80,
-                    "2026-05-27 12:00:00",
-                    "0",
-                    '{"internal":"not-for-api"}',
-                ),
-            )
+        self.write_auth("account@example.test")
+        self.insert_quota_snapshot("account@example.test")
 
         quotas = usage_dashboard.latest_quotas()
 
         self.assertEqual(len(quotas), 1)
         self.assertNotIn("raw_json", quotas[0])
+
+    def test_latest_quotas_only_return_current_auth_accounts(self):
+        self.write_auth("current@example.test")
+        self.insert_quota_snapshot("current@example.test")
+        self.insert_quota_snapshot("removed@example.test")
+
+        quotas = usage_dashboard.latest_quotas()
+
+        self.assertEqual([quota["email"] for quota in quotas], ["current@example.test"])
+
+    def test_latest_quota_age_requires_snapshots_for_all_current_accounts(self):
+        self.write_auth("with-snapshot@example.test", filename="codex-with-snapshot.json")
+        self.write_auth("missing-snapshot@example.test", filename="codex-missing-snapshot.json")
+        self.insert_quota_snapshot("with-snapshot@example.test")
+
+        age = usage_dashboard.latest_quota_age(usage_dashboard.current_quota_account_names())
+
+        self.assertIsNone(age)
 
     def test_day_period_returns_24_hour_buckets_with_zero_fill(self):
         self.insert_usage(dt.datetime(2026, 5, 19, 8, 30), 100, "day-8")

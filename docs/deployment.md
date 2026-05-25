@@ -77,7 +77,7 @@ GET http://127.0.0.1:8320/api/collector-status
 
 - 打开 `http://127.0.0.1:8320/`，确认页面首屏、KPI、图表和表格渲染。
 - 切换日期选择器的日、月、年，确认请求列表跟随筛选。
-- 点击顶部“刷新”，确认普通刷新完成且有 toast 反馈。
+- 点击顶部“刷新”，确认仪表盘刷新完成、账号余量请求走 `/api/quota?force=1`，且有 toast 反馈。
 - 点击账号余量面板刷新按钮，确认 `/api/quota?force=1` 行为符合预期；没有真实 OAuth 凭证时允许返回空列表或外部接口错误。
 
 兼容性验证：
@@ -121,7 +121,7 @@ python ~/.cli-proxy-api/usage-dashboard/usage_dashboard.py run
 - `/api/summary`、`/api/requests` 返回 JSON 且无 500。
 - SQLite 中 `usage_events.api_key_hash` 可用于聚合，`usage_events.raw_json` 不应包含完整 API key 或 OAuth token。
 - `/api/quota` 不应返回 `raw_json`。
-- 页面自动刷新 30 秒一次，手动刷新不会触发强制余量刷新；账号余量按钮才会触发 `force=1`。
+- 页面自动刷新 30 秒一次并使用普通 `/api/quota`；顶部“刷新”和账号余量按钮都会触发 `force=1`。
 
 ## 回滚方案
 

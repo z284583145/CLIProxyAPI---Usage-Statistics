@@ -160,7 +160,7 @@ flowchart LR
 2. 页面 JavaScript 根据日期选择器请求 `/api/summary?period_type=...&period_key=...`。
 3. 页面 JavaScript 同时请求 `/api/quota`、`/api/requests?period_type=...&period_key=...` 和 `/api/collector-status`。
 4. 页面每 30 秒执行一次普通 `load()` 刷新。
-5. 顶部“刷新”按钮也执行普通 `load()`。
+5. 顶部“刷新”按钮执行 `load({forceQuota: true})`，随仪表盘数据一起强制刷新账号余量。
 6. 用户点击账号余量面板里的刷新按钮时，会请求 `/api/quota?force=1`。
 
 ## 6. 数据库表
@@ -328,9 +328,10 @@ User-Agent: codex-cli
 
 - 采集器在 `collect_forever()` 中按 `quota_refresh_seconds` 周期调用 `refresh_quota(force=True)`。
 - 页面普通 `load()` 会请求 `/api/quota`，后端先执行 `refresh_quota(force=False)`。
-- `force=False` 时，如果最新快照未超过 `quota_refresh_seconds`，只返回本地数据库快照。
+- `force=False` 时，如果当前 OAuth 账号的最新快照未超过 `quota_refresh_seconds`，只返回本地数据库快照。
 - 如果没有快照或快照已过期，普通 `/api/quota` 会触发真实余量刷新。
-- 账号余量面板内的刷新按钮请求 `/api/quota?force=1`，强制刷新真实余量。
+- 顶部“刷新”和账号余量面板内的刷新按钮都会请求 `/api/quota?force=1`，强制刷新真实余量。
+- `/api/quota` 只返回当前 OAuth 文件中仍存在且带有 `access_token` 的账号，避免已移除账号的历史快照继续占位。
 
 维护注意：
 

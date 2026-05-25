@@ -5,6 +5,7 @@
 ### Changed
 
 - Updated the embedded dashboard visual style to align with the management-center palette, table treatment, status pills, rounded charts, and toast feedback for manual refresh actions.
+- 顶部手动刷新现在会随仪表盘一起强制刷新账号余量，余量接口也会忽略本地 OAuth 文件中已不存在账号的历史快照。
 - Added a collector watchdog for the unified `run` command so an unexpectedly exited collector target is restarted while the dashboard process remains alive.
 - Removed an unused test import and cleaned ignored Python cache artifacts from the working tree.
 

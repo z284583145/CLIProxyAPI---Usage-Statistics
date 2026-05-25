@@ -332,9 +332,24 @@ def insert_usage(raw_items):
     return inserted
 
 
-def latest_quota_age():
+def latest_quota_age(account_names=None):
+    params = []
+    where_sql = ""
+    if account_names is not None:
+        account_names = sorted(set(account_names))
+        if not account_names:
+            return None
+        placeholders = ",".join("?" for _ in account_names)
+        where_sql = f" WHERE email IN ({placeholders})"
+        params = list(account_names)
     with db_connect() as conn:
-        row = conn.execute("SELECT MAX(ts_epoch) AS ts FROM quota_snapshots").fetchone()
+        row = conn.execute(
+            f"SELECT MAX(ts_epoch) AS ts, COUNT(DISTINCT email) AS account_count FROM quota_snapshots{where_sql}",
+            params,
+        ).fetchone()
+    # 只有当前账号都已有快照时，才能用最新快照年龄判断是否跳过真实刷新。
+    if account_names is not None and row["account_count"] < len(account_names):
+        return None
     return None if row["ts"] is None else time.time() - row["ts"]
 
 
@@ -342,25 +357,42 @@ def auth_files():
     return sorted(glob.glob(os.path.join(AUTH_DIR, "codex-*.json")))
 
 
+def quota_auth_entries():
+    entries = []
+    for path in auth_files():
+        try:
+            with open(path, encoding="utf-8-sig") as f:
+                auth = json.load(f)
+        except (OSError, json.JSONDecodeError) as exc:
+            print(f"quota auth read failed for {path}: {exc}", file=sys.stderr)
+            continue
+        token = auth.get("access_token")
+        if not token:
+            continue
+        entries.append({"path": path, "email": auth.get("email") or os.path.basename(path), "token": token})
+    return entries
+
+
+def current_quota_account_names():
+    return sorted({entry["email"] for entry in quota_auth_entries()})
+
+
 def refresh_quota(force=False):
     cfg = load_config()
-    age = latest_quota_age()
+    entries = quota_auth_entries()
+    age = latest_quota_age([entry["email"] for entry in entries])
     if not force and age is not None and age < int(cfg["quota_refresh_seconds"]):
         return 0
     now = dt.datetime.now(dt.timezone.utc)
     inserted = 0
     with db_connect() as conn:
-        for path in auth_files():
+        for entry in entries:
+            path = entry["path"]
             try:
-                auth = json.load(open(path))
-                token = auth.get("access_token")
-                email = auth.get("email") or os.path.basename(path)
-                if not token:
-                    continue
                 req = urllib.request.Request(
                     "https://chatgpt.com/backend-api/wham/usage",
                     headers={
-                        "Authorization": "Bearer " + token,
+                        "Authorization": "Bearer " + entry["token"],
                         "Accept": "application/json",
                         "User-Agent": "codex-cli",
                     },
@@ -384,7 +416,7 @@ def refresh_quota(force=False):
                     (
                         now.isoformat(),
                         now.timestamp(),
-                        email,
+                        entry["email"],
                         data.get("plan_type"),
                         1 if rl.get("allowed") else 0,
                         1 if rl.get("limit_reached") else 0,
@@ -788,15 +820,24 @@ def query_summary(period_type="today", period_key=None):
 
 def latest_quotas(force=False):
     refresh_quota(force=force)
+    account_names = current_quota_account_names()
+    if not account_names:
+        return []
+    # 余量表是历史快照表，返回前必须按当前 OAuth 文件过滤掉已移除账号。
+    placeholders = ",".join("?" for _ in account_names)
     with db_connect() as conn:
         rows = conn.execute(
-            """
+            f"""
             SELECT q.* FROM quota_snapshots q
             JOIN (
-              SELECT email, MAX(ts_epoch) ts FROM quota_snapshots GROUP BY email
+              SELECT email, MAX(ts_epoch) ts FROM quota_snapshots
+              WHERE email IN ({placeholders})
+              GROUP BY email
             ) latest ON latest.email = q.email AND latest.ts = q.ts_epoch
+            WHERE q.email IN ({placeholders})
             ORDER BY email
-            """
+            """,
+            account_names + account_names,
         ).fetchall()
     return [{key: row[key] for key in row.keys() if key != "raw_json"} for row in rows]
 
@@ -1434,7 +1475,7 @@ async function refreshDashboard(){
   const button = $('refresh');
   button.disabled = true;
   try {
-    await load();
+    await load({forceQuota: true});
     showToast('success', '刷新成功');
   } catch (error) {
     console.error(error);
@@ -1443,10 +1484,11 @@ async function refreshDashboard(){
     button.disabled = false;
   }
 }
-async function load(){
+async function load({forceQuota = false} = {}){
+  const quotaRequest = forceQuota ? getJSON('/api/quota?force=1') : getJSON('/api/quota');
   const [summary, quota, reqs, collector] = await Promise.all([
     getJSON(summaryUrl()),
-    getJSON('/api/quota'),
+    quotaRequest,
     getJSON(requestsUrl()),
     getJSON('/api/collector-status')
   ]);
