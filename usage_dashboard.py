@@ -842,11 +842,24 @@ def query_summary(period_type="today", period_key=None):
             (start, end),
         ).fetchall()
         api_stats = {row["api_key_hash"]: {k: row[k] for k in row.keys() if k != "api_key_hash"} for row in apis}
+    account_rows = [dict(x) for x in accounts]
+    subscription_by_email = {
+        entry["email"]: {
+            "subscription_expired_at": entry.get("subscription_expired_at", ""),
+            "subscription_remaining_days": entry.get("subscription_remaining_days"),
+        }
+        for entry in quota_auth_entries()
+    }
+    for item in account_rows:
+        # 账号消耗来自历史用量；只有仍能匹配本地 OAuth 文件的账号才有订阅剩余天数。
+        subscription = subscription_by_email.get(item["account"], {})
+        item["subscription_expired_at"] = subscription.get("subscription_expired_at", "")
+        item["subscription_remaining_days"] = subscription.get("subscription_remaining_days")
     return {
         "range": period_type if is_legacy_range else period_payload["key"],
         "period": period_payload,
         "summary": dict(total),
-        "accounts": [dict(x) for x in accounts],
+        "accounts": account_rows,
         "models": [dict(x) for x in models],
         "hours": hour_rows,
         "apis": configured_api_summaries(api_stats, cfg["cliproxy_config_path"]),
@@ -1068,6 +1081,16 @@ DASHBOARD_HTML = r"""<!doctype html>
     tbody tr:last-child td { border-bottom:0; }
     td.num, th.num { text-align:right; }
     .scroll { overflow:auto; max-height:420px; }
+    .accounts-panel { min-height:302px; }
+    .accounts-scroll { max-height:260px; overflow:auto; }
+    .accounts-table { table-layout:fixed; font-size:12px; }
+    .accounts-table th, .accounts-table td { padding:8px 6px; overflow:hidden; text-overflow:ellipsis; }
+    .accounts-table th:nth-child(1), .accounts-table td:nth-child(1) { width:31%; }
+    .accounts-table th:nth-child(2), .accounts-table td:nth-child(2) { width:8%; }
+    .accounts-table th:nth-child(3), .accounts-table td:nth-child(3), .accounts-table th:nth-child(4), .accounts-table td:nth-child(4) { width:13%; }
+    .accounts-table th:nth-child(5), .accounts-table td:nth-child(5) { width:11%; }
+    .accounts-table th:nth-child(6), .accounts-table td:nth-child(6) { width:10%; }
+    .accounts-table th:nth-child(7), .accounts-table td:nth-child(7), .accounts-table th:nth-child(8), .accounts-table td:nth-child(8) { width:7%; text-align:right; }
     .quota-scroll { overflow-x:hidden; }
     .quota-table { table-layout:fixed; font-size:12px; }
     .quota-table th, .quota-table td { padding:7px 6px; overflow:hidden; text-overflow:ellipsis; }
@@ -1160,7 +1183,7 @@ DASHBOARD_HTML = r"""<!doctype html>
       <div class="panel model-panel"><h2>模型消耗</h2><canvas id="modelChart" width="520" height="260"></canvas></div>
     </section>
     <section class="grid two">
-      <div class="panel table-panel"><h2>账号消耗</h2><div class="scroll"><table><thead><tr><th>账号</th><th class="num">请求</th><th class="num">总 Token</th><th class="num">输入</th><th class="num">输出</th><th class="num">推理</th><th class="num">失败</th></tr></thead><tbody id="accounts"></tbody></table></div></div>
+      <div class="panel table-panel accounts-panel"><h2>账号消耗<span class="heading-count" id="accountCount">（0）</span></h2><div class="scroll accounts-scroll"><table class="accounts-table"><thead><tr><th>账号</th><th class="num">请求</th><th class="num">总 Token</th><th class="num">输入</th><th class="num">输出</th><th class="num">推理</th><th class="num">失败</th><th class="num">天数</th></tr></thead><tbody id="accounts"></tbody></table></div></div>
       <div class="panel api-panel"><h2>API 详细统计<span class="heading-count" id="apiKeyCount">（0）</span></h2><div class="api-list" id="apiDetails"></div></div>
     </section>
     <section class="panel table-panel" style="margin-top:14px"><h2>最近每次请求/任务</h2><div class="scroll"><table><thead><tr><th>时间</th><th>账号</th><th>API</th><th>模型</th><th class="num">总 Token</th><th class="num">输入</th><th class="num">输出</th><th class="num">推理</th><th class="num">耗时</th><th>状态</th></tr></thead><tbody id="requests"></tbody></table></div></section>
@@ -1561,7 +1584,8 @@ async function load({forceQuota = false} = {}){
   $('kReq').textContent = fmt(s.requests); $('kFail').textContent = '失败 ' + fmt(s.failed);
   $('kTok').textContent = fmt(s.total_tokens); $('kIn').textContent = fmt(s.input_tokens);
   $('kOut').textContent = fmt(s.output_tokens); $('kReason').textContent = fmt(s.reasoning_tokens);
-  $('accounts').innerHTML = summary.accounts.map(a => `<tr><td>${esc(a.account)}</td><td class="num">${fmt(a.requests)}</td><td class="num">${fmt(a.total_tokens)}</td><td class="num">${fmt(a.input_tokens)}</td><td class="num">${fmt(a.output_tokens)}</td><td class="num">${fmt(a.reasoning_tokens)}</td><td class="num">${fmt(a.failed)}</td></tr>`).join('');
+  $('accountCount').textContent = `（${summary.accounts.length}）`;
+  $('accounts').innerHTML = summary.accounts.map(a => `<tr><td title="${esc(a.account)}">${esc(a.account)}</td><td class="num">${fmt(a.requests)}</td><td class="num">${fmt(a.total_tokens)}</td><td class="num">${fmt(a.input_tokens)}</td><td class="num">${fmt(a.output_tokens)}</td><td class="num">${fmt(a.reasoning_tokens)}</td><td class="num">${fmt(a.failed)}</td><td class="num" title="${esc(a.subscription_expired_at || '')}">${formatRemainingDays(a.subscription_remaining_days)}</td></tr>`).join('');
   $('apiKeyCount').textContent = `（${summary.apis.length}）`;
   $('quotaAccountCount').textContent = `（${quota.quotas.length}）`;
   renderQuotas(quota.quotas);

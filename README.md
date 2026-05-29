@@ -101,6 +101,12 @@ sequenceDiagram
 
 日期选择器会刷新 KPI、账号消耗、API 统计、模型消耗、主柱状图和“最近每次请求/任务”；不会影响“账号余量”。
 
+### 账号消耗
+
+账号消耗按所选日期周期汇总有用量的账号，标题旁会显示账号个数。列表使用固定高度滚动，避免账号很多时撑高页面并影响右侧 API 统计对齐。
+
+“天数”列来自本地 OAuth 授权文件中的 `expired` 字段；只有账号名能匹配当前 OAuth 文件时才展示剩余天数，无法匹配的历史账号显示 `-`。
+
 ### 账号余量
 
 采集器会定期读取本地 Codex OAuth 文件中的 access token，并查询 ChatGPT 后端的 `wham/usage` 接口，保存每个账号的：
@@ -310,6 +316,8 @@ GET /api/requests?limit=100&period_type=day&period_key=2026-05-19
 为了兼容命令行报表和旧调用，`/api/summary?range=today|1h|5h|24h|7d` 仍然可用；网页面板使用新的 `period_type` / `period_key` 参数。
 
 `/api/requests` 也支持同样的 `period_type` / `period_key` 参数，用于让“最近每次请求/任务”跟随日期选择器过滤；不传时返回全局最新请求。
+
+`/api/summary.accounts` 会为可匹配当前 OAuth 文件的账号附带 `subscription_expired_at` 和 `subscription_remaining_days`，供账号消耗列表展示“天数”。
 
 `/api/quota` 只返回页面展示需要的余量字段，不返回本地保存的 `raw_json`；订阅剩余天数来自本地 OAuth 授权文件的 `expired` 字段。
 

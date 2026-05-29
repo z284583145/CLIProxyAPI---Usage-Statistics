@@ -142,8 +142,23 @@ class DashboardHtmlTest(unittest.TestCase):
         self.assertIn("return String(Math.max(0, Math.ceil(n)));", self.html)
         self.assertNotIn("}天`", self.html)
 
+    def test_account_consumption_panel_shows_count_days_and_uses_compact_scroll(self):
+        self.assertIn(
+            '<h2>账号消耗<span class="heading-count" id="accountCount">（0）</span></h2>',
+            self.html,
+        )
+        self.assertIn('class="panel table-panel accounts-panel"', self.html)
+        self.assertIn('class="scroll accounts-scroll"', self.html)
+        self.assertIn('class="accounts-table"', self.html)
+        self.assertIn("<th>天数</th>", self.html)
+        self.assertIn(".accounts-panel { min-height:302px; }", self.html)
+        self.assertIn(".accounts-scroll { max-height:260px; overflow:auto; }", self.html)
+        self.assertIn(".accounts-table { table-layout:fixed; font-size:12px; }", self.html)
+        self.assertIn("$('accountCount').textContent = `（${summary.accounts.length}）`;", self.html)
+        self.assertIn("formatRemainingDays(a.subscription_remaining_days)", self.html)
+
     def test_tables_and_statuses_follow_management_pill_style(self):
-        self.assertIn('<div class="panel table-panel"><h2>账号消耗</h2>', self.html)
+        self.assertIn('<div class="panel table-panel accounts-panel"><h2>账号消耗', self.html)
         self.assertIn('<div class="panel table-panel"><div class="panel-head"><h2>账号余量', self.html)
         self.assertIn('<section class="panel table-panel" style="margin-top:14px">', self.html)
         self.assertIn(".table-panel { background:var(--panel); }", self.html)
@@ -536,6 +551,23 @@ class DashboardPeriodSummaryTest(unittest.TestCase):
         age = usage_dashboard.latest_quota_age(usage_dashboard.current_quota_account_names())
 
         self.assertIsNone(age)
+
+    def test_summary_accounts_include_remaining_days_from_matching_oauth_account(self):
+        expires_at = dt.datetime.now(usage_dashboard.LOCAL_TZ) + dt.timedelta(days=2, minutes=5)
+        self.write_auth(
+            "account-1",
+            expired=expires_at.isoformat(timespec="seconds"),
+        )
+        self.insert_usage(dt.datetime(2026, 5, 19, 8, 30), 100, "account-days")
+
+        summary = usage_dashboard.query_summary("day", "2026-05-19")
+
+        self.assertEqual(summary["accounts"][0]["account"], "account-1")
+        self.assertEqual(
+            summary["accounts"][0]["subscription_expired_at"],
+            expires_at.strftime("%Y-%m-%d %H:%M:%S"),
+        )
+        self.assertEqual(summary["accounts"][0]["subscription_remaining_days"], 3)
 
     def test_day_period_returns_24_hour_buckets_with_zero_fill(self):
         self.insert_usage(dt.datetime(2026, 5, 19, 8, 30), 100, "day-8")

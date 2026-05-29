@@ -242,7 +242,7 @@ SQLite 使用 WAL 模式，并设置了 `busy_timeout=5000`。
 | 接口 | 参数 | 返回内容 |
 | --- | --- | --- |
 | `GET /api/health` | 无 | 服务状态、数据库路径、凭证文件数量。 |
-| `GET /api/summary?period_type=day&period_key=2026-05-19` | `period_type`、`period_key` | 汇总指标、账号统计、模型统计、周期柱状图桶、API key 统计。 |
+| `GET /api/summary?period_type=day&period_key=2026-05-19` | `period_type`、`period_key` | 汇总指标、账号统计、账号订阅剩余天数、模型统计、周期柱状图桶、API key 统计。 |
 | `GET /api/quota` | 无 | 每个账号最新余量快照，不返回 `raw_json`。 |
 | `GET /api/quota?force=1` | `force=1` | 强制刷新后返回账号余量，不返回 `raw_json`。 |
 | `GET /api/requests?limit=100&period_type=day&period_key=2026-05-19` | `limit`、`period_type`、`period_key` | 指定周期内的最近请求明细，最多 500 条。 |
@@ -276,7 +276,7 @@ year   period_key=YYYY
 | 周期消耗柱状图 | `/api/summary.hours` | 原生 Canvas 绘制；日=24 小时、月=自然日、年=12 个月。 |
 | API 详细统计 | `/api/summary.apis` | 按客户端 API key 脱敏统计请求和 token。 |
 | 模型消耗 | `/api/summary.models` | 原生 Canvas 绘制横向条形图。 |
-| 账号消耗 | `/api/summary.accounts` | 按账号汇总请求和 token。 |
+| 账号消耗 | `/api/summary.accounts` | 按账号汇总请求和 token，标题显示账号个数；匹配当前 OAuth 文件时展示订阅剩余天数。 |
 | 账号余量 | `/api/quota` | 5 小时、7 天剩余百分比和重置时间。 |
 | 最近每次请求/任务 | `/api/requests` | 指定日期周期内的最近请求明细，跟随日期选择器。 |
 
@@ -286,6 +286,7 @@ year   period_key=YYYY
 - `summaryUrl()` 把 `selectedPeriod` 转成 `/api/summary?period_type=...&period_key=...`。
 - `requestsUrl()` 把 `selectedPeriod` 转成 `/api/requests?limit=120&period_type=...&period_key=...`。
 - 图表是原生 `<canvas>` 绘制。
+- 账号消耗列表固定高度滚动，避免账号很多时撑高当前网格行；无法匹配当前 OAuth 文件的历史账号剩余天数显示 `-`。
 - 页面每 30 秒执行一次 `load()` 自动刷新。
 - 日视图柱状图由 `drawDayBars()` 绘制，会压缩左侧 `00:00` 到 `07:00` 的弱化区间，让 `08:00` 到 `24:00` 前的正常显示区占据主要宽度。
 - 柱状图数值标签由 `chartValueLabel()` 和 `drawValueLabel()` 绘制：画布上使用 `K` / `M` 紧凑格式，并通过标签碰撞检测避免相邻大数字重叠。
