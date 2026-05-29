@@ -4,6 +4,7 @@ import datetime as dt
 import glob
 import hashlib
 import json
+import math
 import os
 import socket
 import sqlite3
@@ -357,6 +358,31 @@ def auth_files():
     return sorted(glob.glob(os.path.join(AUTH_DIR, "codex-*.json")))
 
 
+def parse_oauth_expired(value):
+    if not value:
+        return None
+    text = str(value).strip().replace("Z", "+00:00")
+    try:
+        parsed = dt.datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=LOCAL_TZ)
+    return parsed.astimezone(LOCAL_TZ)
+
+
+def subscription_remaining_days(expired_at, now=None):
+    if not expired_at:
+        return None
+    current = now or dt.datetime.now(LOCAL_TZ)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=LOCAL_TZ)
+    seconds = (expired_at - current.astimezone(LOCAL_TZ)).total_seconds()
+    if seconds <= 0:
+        return 0
+    return math.ceil(seconds / 86400)
+
+
 def quota_auth_entries():
     entries = []
     for path in auth_files():
@@ -369,7 +395,16 @@ def quota_auth_entries():
         token = auth.get("access_token")
         if not token:
             continue
-        entries.append({"path": path, "email": auth.get("email") or os.path.basename(path), "token": token})
+        expired_at = parse_oauth_expired(auth.get("expired"))
+        entries.append(
+            {
+                "path": path,
+                "email": auth.get("email") or os.path.basename(path),
+                "token": token,
+                "subscription_expired_at": expired_at.strftime("%Y-%m-%d %H:%M:%S") if expired_at else "",
+                "subscription_remaining_days": subscription_remaining_days(expired_at),
+            }
+        )
     return entries
 
 
@@ -820,7 +855,8 @@ def query_summary(period_type="today", period_key=None):
 
 def latest_quotas(force=False):
     refresh_quota(force=force)
-    account_names = current_quota_account_names()
+    auth_by_email = {entry["email"]: entry for entry in quota_auth_entries()}
+    account_names = sorted(auth_by_email)
     if not account_names:
         return []
     # 余量表是历史快照表，返回前必须按当前 OAuth 文件过滤掉已移除账号。
@@ -839,7 +875,14 @@ def latest_quotas(force=False):
             """,
             account_names + account_names,
         ).fetchall()
-    return [{key: row[key] for key in row.keys() if key != "raw_json"} for row in rows]
+    result = []
+    for row in rows:
+        item = {key: row[key] for key in row.keys() if key != "raw_json"}
+        auth_entry = auth_by_email.get(item["email"], {})
+        item["subscription_expired_at"] = auth_entry.get("subscription_expired_at", "")
+        item["subscription_remaining_days"] = auth_entry.get("subscription_remaining_days")
+        result.append(item)
+    return result
 
 
 def recent_requests(limit=100, period_type=None, period_key=None):
@@ -1025,6 +1068,14 @@ DASHBOARD_HTML = r"""<!doctype html>
     tbody tr:last-child td { border-bottom:0; }
     td.num, th.num { text-align:right; }
     .scroll { overflow:auto; max-height:420px; }
+    .quota-scroll { overflow-x:hidden; }
+    .quota-table { table-layout:fixed; font-size:12px; }
+    .quota-table th, .quota-table td { padding:7px 6px; overflow:hidden; text-overflow:ellipsis; }
+    .quota-table th:nth-child(1), .quota-table td:nth-child(1) { width:36%; }
+    .quota-table th:nth-child(2), .quota-table td:nth-child(2) { width:9%; }
+    .quota-table th:nth-child(3), .quota-table td:nth-child(3), .quota-table th:nth-child(4), .quota-table td:nth-child(4) { width:16%; }
+    .quota-table th:nth-child(5), .quota-table td:nth-child(5) { width:16%; }
+    .quota-table th:nth-child(6), .quota-table td:nth-child(6) { width:7%; text-align:center; }
     .status { display:inline-flex; align-items:center; gap:6px; color:var(--green); background:transparent; border:0; border-radius:0; padding:0; font-weight:700; }
     .status.bad { color:var(--red); }
     .request-status { display:inline-flex; align-items:center; justify-content:center; border:1px solid var(--line); border-radius:9999px; padding:2px 8px; font-size:12px; font-weight:700; }
@@ -1038,6 +1089,8 @@ DASHBOARD_HTML = r"""<!doctype html>
     .bar > span { display:block; height:100%; background:var(--green); }
     .bar > span.warn { background:var(--amber); }
     .bar > span.bad { background:var(--red); }
+    .quota-bar-cell { display:flex; align-items:center; gap:4px; min-width:0; }
+    .quota-table .bar { flex:1 1 auto; min-width:0; }
     .quota-percent { font-weight:700; }
     .quota-percent.good { color:var(--green); }
     .quota-percent.warn { color:var(--amber); }
@@ -1045,8 +1098,9 @@ DASHBOARD_HTML = r"""<!doctype html>
     .api-panel { min-height:302px; }
     .api-list { display:grid; gap:10px; max-height:260px; overflow:auto; padding-right:2px; }
     .api-card { position:relative; border:1px solid var(--line); border-radius:8px; padding:12px; background:var(--surface); }
-    .api-key { font-weight:700; margin-bottom:8px; }
-    .api-metrics { display:flex; gap:6px; flex-wrap:wrap; color:var(--muted); font-size:12px; }
+    .api-card { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
+    .api-key { font-weight:700; margin-bottom:0; flex:none; }
+    .api-metrics { display:flex; gap:6px; flex:1 1 auto; flex-wrap:wrap; color:var(--muted); font-size:12px; }
     .api-pill { display:inline-flex; align-items:center; gap:4px; border:1px solid var(--line); border-radius:999px; background:var(--surface-soft); padding:4px 8px; }
     .api-success { color:var(--green); }
     .api-failed { color:var(--red); }
@@ -1102,12 +1156,12 @@ DASHBOARD_HTML = r"""<!doctype html>
     </section>
     <section class="grid two chart-stack">
       <div class="panel hour-panel"><h2 id="periodChartTitle">按小时消耗</h2><canvas id="hourChart" width="900" height="260"></canvas></div>
-      <div class="panel api-panel"><h2>API 详细统计<span class="heading-count" id="apiKeyCount">（0）</span></h2><div class="api-list" id="apiDetails"></div></div>
+      <div class="panel table-panel"><div class="panel-head"><h2>账号余量<span class="heading-count" id="quotaAccountCount">（0）</span></h2><button type="button" class="icon-button quota-refresh" id="quotaRefresh" aria-label="刷新账号余量" title="刷新账号余量"><svg class="refresh-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M21 12a9 9 0 0 1-15.1 6.6M3 12a9 9 0 0 1 15.1-6.6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M18 3v4h-4M6 21v-4h4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></button></div><div class="scroll quota-scroll"><table class="quota-table"><thead><tr><th>账号</th><th>状态</th><th>5h 剩余</th><th>7d 剩余</th><th>重置时间</th><th>天数</th></tr></thead><tbody id="quotas"></tbody></table></div></div>
       <div class="panel model-panel"><h2>模型消耗</h2><canvas id="modelChart" width="520" height="260"></canvas></div>
     </section>
     <section class="grid two">
       <div class="panel table-panel"><h2>账号消耗</h2><div class="scroll"><table><thead><tr><th>账号</th><th class="num">请求</th><th class="num">总 Token</th><th class="num">输入</th><th class="num">输出</th><th class="num">推理</th><th class="num">失败</th></tr></thead><tbody id="accounts"></tbody></table></div></div>
-      <div class="panel table-panel"><div class="panel-head"><h2>账号余量<span class="heading-count" id="quotaAccountCount">（0）</span></h2><button type="button" class="icon-button quota-refresh" id="quotaRefresh" aria-label="刷新账号余量" title="刷新账号余量"><svg class="refresh-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M21 12a9 9 0 0 1-15.1 6.6M3 12a9 9 0 0 1 15.1-6.6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M18 3v4h-4M6 21v-4h4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></button></div><div class="scroll"><table><thead><tr><th>账号</th><th>状态</th><th>5h 剩余</th><th>7d 剩余</th><th>重置时间</th></tr></thead><tbody id="quotas"></tbody></table></div></div>
+      <div class="panel api-panel"><h2>API 详细统计<span class="heading-count" id="apiKeyCount">（0）</span></h2><div class="api-list" id="apiDetails"></div></div>
     </section>
     <section class="panel table-panel" style="margin-top:14px"><h2>最近每次请求/任务</h2><div class="scroll"><table><thead><tr><th>时间</th><th>账号</th><th>API</th><th>模型</th><th class="num">总 Token</th><th class="num">输入</th><th class="num">输出</th><th class="num">推理</th><th class="num">耗时</th><th>状态</th></tr></thead><tbody id="requests"></tbody></table></div></section>
   </main>
@@ -1120,6 +1174,11 @@ function compact(n){
   if (value >= 1000000) return (value / 1000000).toFixed(value >= 10000000 ? 0 : 1).replace(/\.0$/, '') + 'M';
   if (value >= 1000) return (value / 1000).toFixed(value >= 10000 ? 0 : 1).replace(/\.0$/, '') + 'K';
   return fmt(value);
+}
+function formatLatencySeconds(ms){
+  const seconds = Number(ms || 0) / 1000;
+  if (!Number.isFinite(seconds)) return '0s';
+  return `${seconds.toLocaleString('zh-CN', {maximumFractionDigits: 2})}s`;
 }
 function chartValueLabel(value){
   const n = Number(value || 0);
@@ -1424,7 +1483,13 @@ function drawHorizontal(canvas, rows){
 function quotaBar(v){
   v = Math.max(0, Math.min(100, Number(v) || 0));
   const cls = v < 30 ? 'bad' : (v < 70 ? 'warn' : 'good');
-  return `<div class="bar"><span class="${cls}" style="width:${Math.max(0, Math.min(100, v))}%"></span></div><span class="quota-percent ${cls}">${v}%</span>`;
+  return `<div class="quota-bar-cell"><div class="bar"><span class="${cls}" style="width:${Math.max(0, Math.min(100, v))}%"></span></div><span class="quota-percent ${cls}">${v}%</span></div>`;
+}
+function formatRemainingDays(days){
+  if (days === null || days === undefined || days === '') return '-';
+  const n = Number(days);
+  if (!Number.isFinite(n)) return '-';
+  return String(Math.max(0, Math.ceil(n)));
 }
 function renderApis(rows){
   rows = rows || [];
@@ -1446,7 +1511,7 @@ function renderApis(rows){
 function renderQuotas(rows){
   rows = rows || [];
   $('quotaAccountCount').textContent = `（${rows.length}）`;
-  $('quotas').innerHTML = rows.map(q => `<tr><td>${esc(q.email)}</td><td><span class="status ${q.allowed ? '' : 'bad'}"><span class="dot ${q.allowed ? '' : 'bad'}"></span>${q.allowed ? '可用' : '受限'}</span></td><td>${quotaBar(q.primary_remaining_percent)}</td><td>${quotaBar(q.secondary_remaining_percent)}</td><td><div>${esc(q.primary_reset_at)}</div><div class="muted">${esc(q.secondary_reset_at)}</div></td></tr>`).join('');
+  $('quotas').innerHTML = rows.map(q => `<tr><td title="${esc(q.email)}">${esc(q.email)}</td><td><span class="status ${q.allowed ? '' : 'bad'}"><span class="dot ${q.allowed ? '' : 'bad'}"></span>${q.allowed ? '可用' : '受限'}</span></td><td>${quotaBar(q.primary_remaining_percent)}</td><td>${quotaBar(q.secondary_remaining_percent)}</td><td title="${esc(q.primary_reset_at)} / ${esc(q.secondary_reset_at)}"><div>${esc(q.primary_reset_at)}</div><div class="muted">${esc(q.secondary_reset_at)}</div></td><td title="${esc(q.subscription_expired_at || '')}">${formatRemainingDays(q.subscription_remaining_days)}</td></tr>`).join('');
 }
 function renderCollectorStatus(status){
   const el = $('collectorStatus');
@@ -1500,7 +1565,7 @@ async function load({forceQuota = false} = {}){
   $('apiKeyCount').textContent = `（${summary.apis.length}）`;
   $('quotaAccountCount').textContent = `（${quota.quotas.length}）`;
   renderQuotas(quota.quotas);
-  $('requests').innerHTML = reqs.requests.map(r => `<tr><td>${esc(r.local_time)}</td><td>${esc(r.source || r.auth_index)}</td><td>${esc(r.api_label)}</td><td>${esc(r.model)}</td><td class="num">${fmt(r.total_tokens)}</td><td class="num">${fmt(r.input_tokens)}</td><td class="num">${fmt(r.output_tokens)}</td><td class="num">${fmt(r.reasoning_tokens)}</td><td class="num">${fmt(r.latency_ms)}ms</td><td><span class="request-status ${r.failed ? 'failed' : 'success'}">${r.failed ? '失败' : '成功'}</span></td></tr>`).join('');
+  $('requests').innerHTML = reqs.requests.map(r => `<tr><td>${esc(r.local_time)}</td><td>${esc(r.source || r.auth_index)}</td><td>${esc(r.api_label)}</td><td>${esc(r.model)}</td><td class="num">${fmt(r.total_tokens)}</td><td class="num">${fmt(r.input_tokens)}</td><td class="num">${fmt(r.output_tokens)}</td><td class="num">${fmt(r.reasoning_tokens)}</td><td class="num">${formatLatencySeconds(r.latency_ms)}</td><td><span class="request-status ${r.failed ? 'failed' : 'success'}">${r.failed ? '失败' : '成功'}</span></td></tr>`).join('');
   renderApis(summary.apis);
   const chartTitles = {day:'按小时消耗', month:'按日消耗', year:'按月消耗'};
   $('periodChartTitle').textContent = chartTitles[summary.period?.type] || '按周期消耗';

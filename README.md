@@ -110,6 +110,7 @@ sequenceDiagram
 - 7 天窗口已用百分比和剩余百分比
 - 对应窗口的重置时间
 - credits balance
+- OAuth 授权文件中的订阅到期时间 `expired`，并派生页面展示用的剩余天数
 
 账号余量刷新策略：
 
@@ -310,7 +311,7 @@ GET /api/requests?limit=100&period_type=day&period_key=2026-05-19
 
 `/api/requests` 也支持同样的 `period_type` / `period_key` 参数，用于让“最近每次请求/任务”跟随日期选择器过滤；不传时返回全局最新请求。
 
-`/api/quota` 只返回页面展示需要的余量字段，不返回本地保存的 `raw_json`。
+`/api/quota` 只返回页面展示需要的余量字段，不返回本地保存的 `raw_json`；订阅剩余天数来自本地 OAuth 授权文件的 `expired` 字段。
 
 ## 数据文件
 

@@ -99,6 +99,26 @@ class DashboardHtmlTest(unittest.TestCase):
         self.assertIn("--row-hover:rgba(139, 134, 128, .08)", self.html)
         self.assertIn(".api-card { position:relative; border:1px solid var(--line); border-radius:8px; padding:12px; background:var(--surface); }", self.html)
 
+    def test_api_cards_show_name_and_metrics_on_one_line(self):
+        self.assertRegex(
+            self.html,
+            r"\.api-card \{[^}]*display:flex;[^}]*align-items:center;[^}]*gap:8px;[^}]*flex-wrap:wrap;",
+        )
+        self.assertRegex(
+            self.html,
+            r"\.api-key \{[^}]*font-weight:700;[^}]*margin-bottom:0;",
+        )
+
+    def test_api_details_and_quota_panels_swap_positions(self):
+        quota_panel_pos = self.html.index('id="quotaAccountCount"')
+        model_panel_pos = self.html.index('id="modelChart"')
+        accounts_panel_pos = self.html.index('id="accounts"')
+        api_panel_pos = self.html.index('id="apiDetails"')
+
+        self.assertLess(quota_panel_pos, model_panel_pos)
+        self.assertLess(accounts_panel_pos, api_panel_pos)
+        self.assertLess(quota_panel_pos, api_panel_pos)
+
     def test_quota_percentages_use_red_yellow_green_status_colors(self):
         self.assertIn("const cls = v < 30 ? 'bad' : (v < 70 ? 'warn' : 'good');", self.html)
         self.assertNotIn("v <= 20 ? 'bad'", self.html)
@@ -107,6 +127,20 @@ class DashboardHtmlTest(unittest.TestCase):
         self.assertIn(".quota-percent.good { color:var(--green); }", self.html)
         self.assertIn(".quota-percent.warn { color:var(--amber); }", self.html)
         self.assertIn(".quota-percent.bad { color:var(--red); }", self.html)
+
+    def test_quota_table_shows_remaining_days_without_horizontal_scroll(self):
+        self.assertIn("<th>天数</th>", self.html)
+        self.assertNotIn("<th>剩余天数</th>", self.html)
+        self.assertIn('class="scroll quota-scroll"', self.html)
+        self.assertIn('class="quota-table"', self.html)
+        self.assertIn(".quota-scroll { overflow-x:hidden;", self.html)
+        self.assertIn(".quota-table { table-layout:fixed;", self.html)
+        self.assertIn(".quota-table th:nth-child(5), .quota-table td:nth-child(5) { width:16%; }", self.html)
+        self.assertIn(".quota-table th:nth-child(6), .quota-table td:nth-child(6) { width:7%; text-align:center; }", self.html)
+        self.assertIn("formatRemainingDays(q.subscription_remaining_days)", self.html)
+        self.assertIn("function formatRemainingDays(days)", self.html)
+        self.assertIn("return String(Math.max(0, Math.ceil(n)));", self.html)
+        self.assertNotIn("}天`", self.html)
 
     def test_tables_and_statuses_follow_management_pill_style(self):
         self.assertIn('<div class="panel table-panel"><h2>账号消耗</h2>', self.html)
@@ -314,6 +348,11 @@ class DashboardHtmlTest(unittest.TestCase):
         self.assertIn("getJSON(requestsUrl())", self.html)
         self.assertNotIn("getJSON('/api/requests?limit=120')", self.html)
 
+    def test_recent_request_latency_displays_seconds(self):
+        self.assertIn("function formatLatencySeconds(ms)", self.html)
+        self.assertIn("${formatLatencySeconds(r.latency_ms)}", self.html)
+        self.assertNotIn("${fmt(r.latency_ms)}ms", self.html)
+
     def test_collector_refreshes_quota_every_four_hours(self):
         source = Path(usage_dashboard.__file__).read_text(encoding="utf-8")
         collect_body = source.split("def collect_forever():", 1)[1].split("\ndef range_bounds", 1)[0]
@@ -355,9 +394,12 @@ class DashboardPeriodSummaryTest(unittest.TestCase):
         usage_dashboard.AUTH_DIR = self.original_auth_dir
         self.tmp.cleanup()
 
-    def write_auth(self, email, filename="codex-current.json", token="token"):
+    def write_auth(self, email, filename="codex-current.json", token="token", expired=None):
+        payload = {"email": email, "access_token": token}
+        if expired is not None:
+            payload["expired"] = expired
         Path(usage_dashboard.AUTH_DIR, filename).write_text(
-            json.dumps({"email": email, "access_token": token}, ensure_ascii=False),
+            json.dumps(payload, ensure_ascii=False),
             encoding="utf-8",
         )
 
@@ -463,6 +505,19 @@ class DashboardPeriodSummaryTest(unittest.TestCase):
 
         self.assertEqual(len(quotas), 1)
         self.assertNotIn("raw_json", quotas[0])
+
+    def test_latest_quotas_include_remaining_days_from_oauth_expired(self):
+        expires_at = dt.datetime.now(usage_dashboard.LOCAL_TZ) + dt.timedelta(days=3, minutes=5)
+        self.write_auth(
+            "account@example.test",
+            expired=expires_at.isoformat(timespec="seconds"),
+        )
+        self.insert_quota_snapshot("account@example.test")
+
+        quotas = usage_dashboard.latest_quotas()
+
+        self.assertEqual(quotas[0]["subscription_expired_at"], expires_at.strftime("%Y-%m-%d %H:%M:%S"))
+        self.assertEqual(quotas[0]["subscription_remaining_days"], 4)
 
     def test_latest_quotas_only_return_current_auth_accounts(self):
         self.write_auth("current@example.test")

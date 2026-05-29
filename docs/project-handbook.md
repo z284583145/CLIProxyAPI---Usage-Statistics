@@ -309,6 +309,7 @@ year   period_key=YYYY
 
 - `access_token`
 - `email`，可选；没有时使用文件名
+- `expired`，可选；有值时用于页面展示订阅剩余天数
 
 随后请求：
 
@@ -332,6 +333,7 @@ User-Agent: codex-cli
 - 如果没有快照或快照已过期，普通 `/api/quota` 会触发真实余量刷新。
 - 顶部“刷新”和账号余量面板内的刷新按钮都会请求 `/api/quota?force=1`，强制刷新真实余量。
 - `/api/quota` 只返回当前 OAuth 文件中仍存在且带有 `access_token` 的账号，避免已移除账号的历史快照继续占位。
+- 账号订阅剩余天数不来自 `wham/usage`，而是由本地 OAuth 文件里的 `expired` 派生。
 
 维护注意：
 
